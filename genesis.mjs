@@ -246,7 +246,9 @@ function loadStore() {
     const environment = environmentEndpoint(value.endpoint) === PROD_ENDPOINT ? 'prod' : 'staging';
     value = { version: 3, environment, sessions: { [environment]: value } };
     converted = true;
-  } else if (value.version === 2 && record(value.sessions)) {
+  } else if (value.version === 2) {
+    const legacy = new Set(['main', 'staging']);
+    if (!record(value.sessions) || !legacy.has(value.environment) || Object.keys(value.sessions).some(key => !legacy.has(key))) throw invalid();
     const renamed = key => (key === 'main' ? 'prod' : key);
     value = { version: 3, environment: renamed(value.environment), sessions: Object.fromEntries(Object.entries(value.sessions).map(([key, session]) => [renamed(key), session])) };
     converted = true;
@@ -323,17 +325,23 @@ export function normalizeEndpoint(input) {
   if (value.startsWith('http://')) return { error: 'cleartext http:// is accepted only for localhost; use https://' };
   return { error: 'use https://HOST (or a bare host); other schemes are not gateways' };
 }
-// A key pasted into the URL is registered for redaction and refused, never
-// sent as a path.
+// Anything key-shaped anywhere in the typed URL (a bare key, an embedded or
+// percent-encoded one) is registered for redaction and refused before the
+// URL is canonicalized, resolved or printed.
+const KEY_LIKE = /s99dev\.[A-Za-z0-9_-]{20,512}/gi;
+function refuseKeyInUrl(text) {
+  const matches = text.match(KEY_LIKE);
+  if (matches === null) return;
+  for (const match of matches) if (!acceptKey(match) && !secrets.includes(match)) secrets.unshift(match);
+  throw usage('the gateway URL must not contain a key');
+}
 function environmentEndpoint(input) {
-  const result = normalizeEndpoint(input);
+  const raw = String(input ?? '');
+  refuseKeyInUrl(raw);
+  try { refuseKeyInUrl(decodeURIComponent(raw)); } catch (error) { if (error instanceof CliError) throw error; }
+  const result = normalizeEndpoint(raw);
   if (result.error !== undefined) throw usage(result.error);
-  let url;
-  try { url = new URL(result.value); } catch { throw usage('the gateway URL is invalid'); }
-  for (const segment of url.pathname.split('/')) {
-    if (KEY.test(segment)) { acceptKey(segment); throw usage('the gateway URL must not contain a key'); }
-  }
-  return url.href.replace(/\/+$/, '');
+  try { return new URL(result.value).href.replace(/\/+$/, ''); } catch { throw usage('the gateway URL is invalid'); }
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
@@ -501,8 +509,9 @@ async function readLine(hidden) {
 const columns = () => tty()?.output.columns || 80;
 const summary = (label, value) => term(`${tint('32', glyph.ok)} ${label.padEnd(9)} ${value}\n`);
 // ask(label, validate): validate returns {value} or {error}; the typed line is
-// replaced by a one-line summary once accepted. An empty line takes
-// `fallback` when one is shown.
+// replaced by a one-line summary once accepted, or by the error when refused
+// (so a key pasted here stays on screen no longer than the prompt). An empty
+// line takes `fallback` when one is shown.
 async function ask(label, validate, summaryLabel = label, fallback = null) {
   for (;;) {
     const hint = fallback === null ? '' : ` (${fallback})`;
@@ -510,8 +519,8 @@ async function ask(label, validate, summaryLabel = label, fallback = null) {
     term(`${tint('36', '?')} ${tint('1', label)}${tint('2', hint)} ${glyph.step} `);
     const line = await readLine(false);
     const result = validate(line.trim() === '' && fallback !== null ? fallback : line);
+    if (ansi()) term(`\x1b[${Math.floor((prompt.length + line.length) / columns()) + 1}A\x1b[J`);
     if (result.error === undefined) {
-      if (ansi()) term(`\x1b[${Math.floor((prompt.length + line.length) / columns()) + 1}A\x1b[J`);
       summary(summaryLabel, result.value);
       return result.value;
     }
@@ -1048,13 +1057,15 @@ export function renderUsage(payload) {
     throw new CliError('the usage payload is not in the expected shape');
   }
   const count = value => number(value) === null ? '—' : integer(value);
-  // A provider absent from a covered window used no tokens in it.
+  // A provider absent from a covered window used no tokens in it; a category
+  // the payload leaves out of an existing bucket was not measured.
   const blank = key => (number(payload.windows[key].tokens.total) === null ? null : 0);
+  const cell = (bucket, key, category) => (bucket === undefined ? blank(key) : Object.hasOwn(bucket.tokens, category) ? bucket.tokens[category] : null);
   const gap = ['', '', '', '', ''];
   const section = (title, pick) => [
     [title, '', '', '', ''],
     ...USAGE_CATEGORIES.filter(([category]) => WINDOWS.some(key => Object.hasOwn(pick(key)?.tokens ?? {}, category)))
-      .map(([category, label]) => [`  ${label}`, ...WINDOWS.map(key => count(pick(key)?.tokens[category] ?? blank(key)))]),
+      .map(([category, label]) => [`  ${label}`, ...WINDOWS.map(key => count(cell(pick(key), key, category)))]),
   ];
   const providers = [...new Set(WINDOWS.flatMap(key => Object.keys(payload.windows[key].providers)))].sort((left, right) => left.localeCompare(right));
   const rows = [
@@ -1220,9 +1231,11 @@ function logout(flags) {
 // is retargeted, a connected one re-staged), keeps its saved model when this
 // gateway serves it, and is disabled again when it was disabled.
 async function applyEnvironment(session, flags, view = null) {
-  const rows = (await statusRows(session)).filter(row => row.installed && row.problem === null);
-  if (rows.length === 0) throw new CliError(`none of ${CLIENTS.map(client => client.label).join(', ')} is installed here`);
-  const names = rows.map(row => row.label).join(', ');
+  // Consent comes before scope discovery: OMP's scope lookup may initialize
+  // its state, so only the installed binaries are named here.
+  const clients = CLIENTS.filter(client => installed(client.binary));
+  if (clients.length === 0) throw new CliError(`none of ${CLIENTS.map(client => client.label).join(', ')} is installed here`);
+  const names = clients.map(client => client.label).join(', ');
   const label = environmentLabel(session.environment);
   if (view === null && screenOutput === null) header(session);
   if (!flags.overwrite) {
@@ -1233,9 +1246,11 @@ async function applyEnvironment(session, flags, view = null) {
     }
   }
   const work = async () => {
+    const rows = (await statusRows(session)).filter(row => row.installed);
     const catalog = await api(session, 'GET', '/v1/models');
     const failed = [];
     for (const row of rows) {
+      if (row.problem !== null) { warn(`${row.label} was not checked: ${row.problem}`); failed.push(row); continue; }
       const profile = profileArgs(row.profile || undefined);
       let model = [];
       try {
@@ -1263,15 +1278,14 @@ async function applyEnvironment(session, flags, view = null) {
 }
 
 // ── setup ───────────────────────────────────────────────────────────────────
-// The installer's walkthrough: log into prod (URL and key), select it,
+// The installer's walkthrough, prod only: log in (URL and key), select prod,
 // configure the installed clients for it, then open the dashboard. Rerun any
 // time; a stored login that the gateway still accepts is kept.
 async function setup(flags) {
+  if (flags.environment !== undefined && flags.environment !== 'prod') throw usage('setup creates prod; use genesis environment staging for a second gateway');
   if (!interactive()) throw usage('setup needs a terminal; run genesis login and genesis apply --overwrite instead');
-  const environment = environmentId(flags.environment ?? 'prod');
-  const label = environmentLabel(environment);
-  out(paint('1', `Set up ${label}`));
-  let session = flags.url === undefined ? loadSession(environment) : null;
+  out(paint('1', 'Set up Prod'));
+  let session = flags.url === undefined ? loadSession('prod') : null;
   if (session !== null) {
     try { validateMe(await request(session.endpoint, session.token, 'GET', '/admin/api/cli/me')); done('Logged in', sessionIdentity(session)); } catch (error) {
       if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
@@ -1279,15 +1293,14 @@ async function setup(flags) {
       session = null;
     }
   }
-  if (session === null) session = await login({ environment, url: flags.url });
+  if (session === null) session = await login({ environment: 'prod', url: flags.url });
   const store = loadStore();
-  if (store.environment !== environment) {
-    if (environment !== 'prod') await requireProdDev();
-    store.environment = environment;
+  if (store.environment !== 'prod') {
+    store.environment = 'prod';
     writeSessionText(JSON.stringify(store, null, 2) + '\n');
   }
   await applyEnvironment(session, flags);
-  return dashboard({ environment });
+  return dashboard({ environment: 'prod' });
 }
 async function status(session, flags) {
   header(session);
@@ -2112,7 +2125,7 @@ async function dashboard(flags) {
             else if (['enable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
             else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
             else if (view.action === 'apply') await applyEnvironment(session, flags);
-            else if (view.action === 'logout') { logout({ environment }); session = null; prodDev = false; }
+            else if (view.action === 'logout') { logout({ environment }); session = null; if (environment === 'prod') prodDev = false; }
             else if (view.action === 'update') await update();
           });
           showResult(view, `Complete ${glyph.dot} ${view.actionLabel}`);
