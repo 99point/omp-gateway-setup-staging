@@ -35,13 +35,17 @@ const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
 const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
-const MAIN_ENDPOINT = 'https://genesis.99point.co';
+// Two environments, each with its own gateway URL and personal key. `prod` is
+// the one every install creates; its URL defaults to the canonical Genesis
+// gateway but is whatever the person logs into. `staging` is a developer's
+// second gateway, gated on prod's identity.
+const PROD_ENDPOINT = 'https://genesis.99point.co';
 const ENVIRONMENTS = Object.freeze({
-  main: { label: 'Main', endpoint: MAIN_ENDPOINT },
+  prod: { label: 'Prod', endpoint: PROD_ENDPOINT },
   staging: { label: 'Staging' },
 });
 function environmentId(value) {
-  if (typeof value !== 'string' || !Object.hasOwn(ENVIRONMENTS, value)) throw usage('environment must be main or staging');
+  if (typeof value !== 'string' || !Object.hasOwn(ENVIRONMENTS, value)) throw usage('environment must be prod or staging');
   return value;
 }
 const environmentLabel = environment => ENVIRONMENTS[environment].label;
@@ -148,7 +152,7 @@ function setupScript() {
 
 // ── session store ───────────────────────────────────────────────────────────
 // ${XDG_CONFIG_HOME:-~/.config}/genesis/session.json (0600, dir 0700) holds
-// {version: 2, environment, sessions: {main?, staging?}}, replaced by rename.
+// {version: 3, environment, sessions: {prod?, staging?}}, replaced by rename.
 export function configDir() {
   const xdg = process.env.XDG_CONFIG_HOME;
   return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.config'), 'genesis');
@@ -204,7 +208,7 @@ function writeSessionText(text) {
   try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(temporary, file);
 }
-function storedSession(value, environment) {
+function storedSession(value) {
   const file = sessionFile();
   if (!record(value) || typeof value.endpoint !== 'string' || typeof value.name !== 'string'
     || !ROLES.has(value.role)
@@ -213,7 +217,7 @@ function storedSession(value, environment) {
   }
   if (!acceptKey(value.token)) throw new CliError(`${file} does not hold a personal gateway key; run genesis login`);
   return {
-    endpoint: environmentEndpoint(value.endpoint, environment), name: value.name, role: value.role,
+    endpoint: environmentEndpoint(value.endpoint), name: value.name, role: value.role,
     email: value.email, token: value.token, updatedAt: value.updatedAt, identityClass: identityClassOf(value.identityClass),
   };
 }
@@ -227,25 +231,33 @@ function checkSessionIsolation(store, environment, endpoint, token) {
     if (session.token === token) throw new CliError(`${environmentLabel(environment)} needs its own key; the supplied key belongs to ${environmentLabel(other)}`);
   }
 }
+// Version 1 held one login; version 2 named the environments main/staging.
+// Both convert once: the canonical gateway (or `main`) becomes prod.
 function loadStore() {
   const text = readSessionText();
-  if (text === null) return { version: 2, environment: 'main', sessions: {} };
+  if (text === null) return { version: 3, environment: 'prod', sessions: {} };
   const file = sessionFile();
   let value;
   try { value = JSON.parse(text); } catch { throw new CliError(`${file} is not valid JSON; remove it and run genesis login`); }
-  if (record(value) && value.version === 1) {
-    const environment = environmentEndpoint(value.endpoint) === MAIN_ENDPOINT ? 'main' : 'staging';
-    const session = storedSession(value, environment);
-    const store = { version: 2, environment, sessions: { [environment]: session } };
-    writeSessionText(JSON.stringify(store, null, 2) + '\n');
-    return store;
+  const invalid = () => new CliError(`${file} is not a genesis session store; remove it and run genesis login`);
+  if (!record(value)) throw invalid();
+  let converted = false;
+  if (value.version === 1) {
+    const environment = environmentEndpoint(value.endpoint) === PROD_ENDPOINT ? 'prod' : 'staging';
+    value = { version: 3, environment, sessions: { [environment]: value } };
+    converted = true;
+  } else if (value.version === 2 && record(value.sessions)) {
+    const renamed = key => (key === 'main' ? 'prod' : key);
+    value = { version: 3, environment: renamed(value.environment), sessions: Object.fromEntries(Object.entries(value.sessions).map(([key, session]) => [renamed(key), session])) };
+    converted = true;
   }
-  if (!record(value) || value.version !== 2 || typeof value.environment !== 'string' || !Object.hasOwn(ENVIRONMENTS, value.environment) || !record(value.sessions)
+  if (value.version !== 3 || typeof value.environment !== 'string' || !Object.hasOwn(ENVIRONMENTS, value.environment) || !record(value.sessions)
     || Object.keys(value.sessions).some(environment => !Object.hasOwn(ENVIRONMENTS, environment))) {
-    throw new CliError(`${file} is not a genesis session store; remove it and run genesis login`);
+    throw invalid();
   }
-  for (const [environment, session] of Object.entries(value.sessions)) value.sessions[environment] = storedSession(session, environment);
+  for (const [environment, session] of Object.entries(value.sessions)) value.sessions[environment] = storedSession(session);
   for (const [environment, session] of Object.entries(value.sessions)) checkSessionIsolation(value, environment, session.endpoint, session.token);
+  if (converted) writeSessionText(JSON.stringify(value, null, 2) + '\n');
   return value;
 }
 export function loadSession(environment) {
@@ -257,15 +269,15 @@ export function loadSession(environment) {
 function saveSession(session) {
   const store = loadStore();
   checkSessionIsolation(store, session.environment, session.endpoint, session.token);
-  store.sessions[session.environment] = storedSession({ ...session, updatedAt: new Date().toISOString() }, session.environment);
+  store.sessions[session.environment] = storedSession({ ...session, updatedAt: new Date().toISOString() });
   writeSessionText(JSON.stringify(store, null, 2) + '\n');
 }
 async function selectEnvironment(environment, view = null) {
   environmentId(environment);
   let session = loadSession(environment);
-  if (environment !== 'main') {
+  if (environment !== 'prod') {
     if (session === null) session = await login({ environment }, view);
-    else await requireMainDev(view);
+    else await requireProdDev(view);
   }
   const store = loadStore();
   store.environment = environment;
@@ -285,8 +297,8 @@ function clearSession(environment) {
 async function requireSession(flags) {
   const store = loadStore();
   const environment = environmentId(flags.environment ?? store.environment);
-  if (environment !== 'main') {
-    await runAction('Main access', async view => { await requireMainDev(view); return false; }, true);
+  if (environment !== 'prod') {
+    await runAction('Prod access', async view => { await requireProdDev(view); return false; }, true);
   }
   const session = store.sessions[environment];
   if (session === undefined) throw new CliError(`${environmentLabel(environment)} is not logged in; run genesis login --environment ${environment}`);
@@ -311,16 +323,17 @@ export function normalizeEndpoint(input) {
   if (value.startsWith('http://')) return { error: 'cleartext http:// is accepted only for localhost; use https://' };
   return { error: 'use https://HOST (or a bare host); other schemes are not gateways' };
 }
-function environmentEndpoint(input, environment) {
+// A key pasted into the URL is registered for redaction and refused, never
+// sent as a path.
+function environmentEndpoint(input) {
   const result = normalizeEndpoint(input);
   if (result.error !== undefined) throw usage(result.error);
-  let endpoint;
-  try { endpoint = new URL(result.value).href.replace(/\/+$/, ''); } catch { throw usage('the gateway URL is invalid'); }
-  if (environment === 'main' && endpoint !== MAIN_ENDPOINT) throw usage(`Main is fixed at ${MAIN_ENDPOINT}; use login --environment staging --url URL for another gateway`);
-  if (environment === 'staging' && new URL(endpoint).hostname.toLowerCase().replace(/\.$/, '') === new URL(MAIN_ENDPOINT).hostname) {
-    throw usage(`${endpoint} is Main, not Staging`);
+  let url;
+  try { url = new URL(result.value); } catch { throw usage('the gateway URL is invalid'); }
+  for (const segment of url.pathname.split('/')) {
+    if (KEY.test(segment)) { acceptKey(segment); throw usage('the gateway URL must not contain a key'); }
   }
-  return endpoint;
+  return url.href.replace(/\/+$/, '');
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
@@ -488,13 +501,15 @@ async function readLine(hidden) {
 const columns = () => tty()?.output.columns || 80;
 const summary = (label, value) => term(`${tint('32', glyph.ok)} ${label.padEnd(9)} ${value}\n`);
 // ask(label, validate): validate returns {value} or {error}; the typed line is
-// replaced by a one-line summary once accepted.
-async function ask(label, validate, summaryLabel = label) {
+// replaced by a one-line summary once accepted. An empty line takes
+// `fallback` when one is shown.
+async function ask(label, validate, summaryLabel = label, fallback = null) {
   for (;;) {
-    const prompt = `? ${label} ${glyph.step} `;
-    term(`${tint('36', '?')} ${tint('1', label)} ${glyph.step} `);
+    const hint = fallback === null ? '' : ` (${fallback})`;
+    const prompt = `? ${label}${hint} ${glyph.step} `;
+    term(`${tint('36', '?')} ${tint('1', label)}${tint('2', hint)} ${glyph.step} `);
     const line = await readLine(false);
-    const result = validate(line);
+    const result = validate(line.trim() === '' && fallback !== null ? fallback : line);
     if (result.error === undefined) {
       if (ansi()) term(`\x1b[${Math.floor((prompt.length + line.length) / columns()) + 1}A\x1b[J`);
       summary(summaryLabel, result.value);
@@ -977,7 +992,7 @@ async function switchScope(session, client, action, flags) {
   return runAction(`${action} ${client.label}`, async () => {
     if (action === 'enable') {
       const state = readState((await resolveScope(client, flags.profile)).stateFile, client.id);
-      if (state?.gateway && state.gateway !== MAIN_ENDPOINT) await requireMainDev();
+      if (state?.gateway && state.gateway !== (loadSession('prod')?.endpoint ?? PROD_ENDPOINT)) await requireProdDev();
     }
     await runSetup(session, client, action, profileArgs(flags.profile), false);
     done({ enable: 'Enabled', disable: 'Disabled', unset: 'Unset' }[action], flags.profile ? `${client.label} (${flags.profile})` : client.label);
@@ -1022,31 +1037,35 @@ const USAGE_CATEGORIES = [
   ['cache_write_5m', 'cache write 5m'], ['cache_write_1h', 'cache write 1h'],
   ['orchestration_input', 'orchestration input'], ['orchestration_cache_read', 'orchestration read'], ['orchestration_output', 'orchestration out'],
 ];
+// One aligned table: a section per provider (all providers first) with the
+// token categories down and the windows across. Counts only; cost is metered
+// elsewhere. A window without ledger coverage shows — and is named below.
 export function renderUsage(payload) {
-  const bucket = value => record(value) && record(value.tokens) && record(value.ratesPerDay);
+  const bucket = value => record(value) && record(value.tokens);
   if (!record(payload) || !record(payload.windows)
     || WINDOWS.some(key => !bucket(payload.windows[key]) || !record(payload.windows[key].providers)
       || Object.values(payload.windows[key].providers).some(value => !bucket(value)))) {
     throw new CliError('the usage payload is not in the expected shape');
   }
   const count = value => number(value) === null ? '—' : integer(value);
-  const rate = value => number(value) === null ? '—' : amount(value);
-  const renderBucket = (name, value) => {
-    const cost = number(value.cost) === null ? '—' : `$${value.cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-    return `${name} ${glyph.dot} ${count(value.calls)} calls ${glyph.dot} ${count(value.errors)} errors ${glyph.dot} ${cost}\n`
-      + table(['category', 'tokens', 'tokens/day'], USAGE_CATEGORIES
-        .filter(([key]) => Object.hasOwn(value.tokens, key))
-        .map(([key, label]) => [label, count(value.tokens[key]), rate(value.ratesPerDay[key])]), new Set([1, 2]));
-  };
-  return WINDOWS.map(key => {
-    const window = payload.windows[key];
-    const coverage = payload.coverage?.windows?.[key];
-    const status = coverage?.status === 'unavailable' ? 'unavailable'
-      : coverage?.status === 'partial' ? 'partial history' : '';
-    return [key + (status ? ` ${glyph.dot} ${status}` : ''), renderBucket('all providers', window),
-      ...Object.entries(window.providers).sort(([left], [right]) => left.localeCompare(right))
-        .map(([provider, value]) => renderBucket(provider, value))].join('\n\n');
-  }).join('\n\n');
+  // A provider absent from a covered window used no tokens in it.
+  const blank = key => (number(payload.windows[key].tokens.total) === null ? null : 0);
+  const gap = ['', '', '', '', ''];
+  const section = (title, pick) => [
+    [title, '', '', '', ''],
+    ...USAGE_CATEGORIES.filter(([category]) => WINDOWS.some(key => Object.hasOwn(pick(key)?.tokens ?? {}, category)))
+      .map(([category, label]) => [`  ${label}`, ...WINDOWS.map(key => count(pick(key)?.tokens[category] ?? blank(key)))]),
+  ];
+  const providers = [...new Set(WINDOWS.flatMap(key => Object.keys(payload.windows[key].providers)))].sort((left, right) => left.localeCompare(right));
+  const rows = [
+    ...section('all providers', key => payload.windows[key]),
+    ...providers.flatMap(provider => [gap, ...section(provider, key => payload.windows[key].providers[provider])]),
+  ];
+  const coverage = WINDOWS.map(key => {
+    const status = payload.coverage?.windows?.[key]?.status;
+    return status === 'unavailable' ? `${key}: unavailable` : status === 'partial' ? `${key}: partial history` : null;
+  }).filter(line => line !== null);
+  return table(['', ...WINDOWS], rows, new Set([1, 2, 3, 4])) + (coverage.length > 0 ? `\n\n${coverage.join(`  ${glyph.dot}  `)}` : '');
 }
 export function renderCapacity(payload, nowMs = Date.now()) {
   if (!record(payload) || !Array.isArray(payload.providers)) throw new CliError('the capacity payload is not in the expected shape');
@@ -1108,22 +1127,24 @@ function validateMe(value) {
   }
   return { name: value.name, role: value.role, email: value.email, identityClass: identityClassOf(value.identityClass) };
 }
-const isMainDev = identity => identity?.identityClass === 'internal' && ['owner', 'admin'].includes(identity.role);
-async function requireMainDev(view = null) {
-  const main = loadSession('main');
-  if (main === null) throw new CliError('Main login required for another gateway; run genesis login --environment main first');
+const isProdDev = identity => identity?.identityClass === 'internal' && ['owner', 'admin'].includes(identity.role);
+// A second gateway is a developer feature: the stored prod key must still be
+// accepted by prod's gateway and belong to an internal owner or admin.
+async function requireProdDev(view = null) {
+  const prod = loadSession('prod');
+  if (prod === null) throw new CliError('Prod login required for another gateway; run genesis login --environment prod first');
   const check = async () => {
     let identity;
-    try { identity = await request(MAIN_ENDPOINT, main.token, 'GET', '/admin/api/cli/me'); } catch (error) {
+    try { identity = await request(prod.endpoint, prod.token, 'GET', '/admin/api/cli/me'); } catch (error) {
       if (error instanceof HttpError && [401, 403].includes(error.status)) {
-        throw new CliError('Main no longer accepts the stored key; run genesis login --environment main again');
+        throw new CliError('Prod no longer accepts the stored key; run genesis login --environment prod again');
       }
       throw error;
     }
     validateMe(identity);
-    if (!isMainDev(identity)) throw new CliError('Another gateway requires an internal Main owner or admin');
+    if (!isProdDev(identity)) throw new CliError('Another gateway requires an internal Prod owner or admin');
   };
-  return view === null || screenOutput !== null ? check() : runProgress(view, 'Checking Main access', check);
+  return view === null || screenOutput !== null ? check() : runProgress(view, 'Checking Prod access', check);
 }
 async function reachable(endpoint) {
   try {
@@ -1134,27 +1155,29 @@ async function reachable(endpoint) {
     return error.message;
   }
 }
+// Log into one environment: its gateway URL (a prompt offers the stored one,
+// or the canonical gateway for prod) and its own personal key. `--url` sets
+// the URL unattended; prod without a URL uses its default, staging refuses.
 export async function login(flags, view = null) {
   const store = loadStore();
-  const supplied = flags.url === undefined ? undefined : environmentEndpoint(flags.url);
-  const environment = environmentId(flags.environment ?? (supplied === undefined ? store.environment : supplied === MAIN_ENDPOINT ? 'main' : 'staging'));
-  let endpoint = supplied ?? store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint;
-  if (endpoint !== undefined) endpoint = environmentEndpoint(endpoint, environment);
-  if (environment !== 'main') await requireMainDev(view);
-  if (endpoint === undefined) {
-    if (!interactive()) throw usage('Staging is not configured; run genesis login --environment staging --url URL with its own AGENT_AUTH_TOKEN');
-    endpoint = await ask('Staging gateway URL', value => {
-      try { return { value: environmentEndpoint(value, environment) }; } catch (error) { return { error: error.message }; }
-    }, 'Gateway');
+  const environment = environmentId(flags.environment ?? store.environment);
+  const label = environmentLabel(environment);
+  let endpoint = flags.url === undefined ? store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint : environmentEndpoint(flags.url);
+  if (environment !== 'prod') await requireProdDev(view);
+  const validateUrl = value => { try { return { value: environmentEndpoint(value) }; } catch (error) { return { error: error.message }; } };
+  if (flags.url === undefined && interactive()) {
+    done('Environment', label);
+    endpoint = await ask(`${label} gateway URL`, validateUrl, 'Gateway', endpoint ?? null);
+  } else if (endpoint === undefined) {
+    throw usage(`${label} is not configured; run genesis login --environment ${environment} --url URL with its own AGENT_AUTH_TOKEN`);
   }
   let token = process.env.AGENT_AUTH_TOKEN ?? '';
   if (token !== '' && interactive() && Object.entries(store.sessions).some(([other, session]) => other !== environment && session.token === token)) token = '';
   const source = token === '' ? 'entered' : 'env';
   if (token === '') {
-    if (!interactive()) throw usage(`${environmentLabel(environment)} login needs AGENT_AUTH_TOKEN or a terminal to enter its key`);
-    done('Environment', environmentLabel(environment));
-    done('Gateway', endpoint);
-    token = await secret(`${environmentLabel(environment)} key`, 'Key');
+    if (!interactive()) throw usage(`${label} login needs AGENT_AUTH_TOKEN or a terminal to enter its key`);
+    if (flags.url !== undefined) { done('Environment', label); done('Gateway', endpoint); }
+    token = await secret(`${label} key`, 'Key');
   }
   let identity;
   for (let attempts = 0; ; attempts++) {
@@ -1163,7 +1186,7 @@ export async function login(flags, view = null) {
     else {
       checkSessionIsolation(store, environment, endpoint, token);
       const check = async () => {
-        if (environment !== 'main') await requireMainDev();
+        if (environment !== 'prod') await requireProdDev();
         const problem = await reachable(endpoint);
         if (problem !== null) throw new CliError(problem);
         done('Gateway', endpoint);
@@ -1189,6 +1212,82 @@ export async function login(flags, view = null) {
 function logout(flags) {
   const environment = clearSession(flags.environment);
   done('Logged out', environmentLabel(environment));
+}
+
+// ── apply ───────────────────────────────────────────────────────────────────
+// Point every discoverable scope of an installed client at the selected
+// environment: each is configured with that gateway and key (a foreign scope
+// is retargeted, a connected one re-staged), keeps its saved model when this
+// gateway serves it, and is disabled again when it was disabled.
+async function applyEnvironment(session, flags, view = null) {
+  const rows = (await statusRows(session)).filter(row => row.installed && row.problem === null);
+  if (rows.length === 0) throw new CliError(`none of ${CLIENTS.map(client => client.label).join(', ')} is installed here`);
+  const names = rows.map(row => row.label).join(', ');
+  const label = environmentLabel(session.environment);
+  if (view === null && screenOutput === null) header(session);
+  if (!flags.overwrite) {
+    if (!interactive()) throw usage(`apply needs --overwrite without a terminal; it replaces the gateway settings and keys of ${names}`);
+    if (!(await confirm(`Configure ${names} for ${label} (${session.endpoint})? Their gateway settings and keys are replaced`, true))) {
+      out('Left the clients alone; no user files changed.');
+      return false;
+    }
+  }
+  const work = async () => {
+    const catalog = await api(session, 'GET', '/v1/models');
+    const failed = [];
+    for (const row of rows) {
+      const profile = profileArgs(row.profile || undefined);
+      let model = [];
+      try {
+        const current = currentModelId(row.state);
+        if (current !== null && servedModels(catalog, row.client).some(entry => entry.id === current)) model = ['--model', current];
+      } catch (error) {
+        if (error instanceof Interrupt) throw error;
+      }
+      try {
+        await runSetup(session, row.client, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true);
+        if (row.state?.mode === 'disabled') await runSetup(session, row.client, 'disable', profile, false);
+        done('Configured', row.state?.mode === 'disabled' ? `${row.label} ${glyph.dot} disabled` : row.label);
+      } catch (error) {
+        if (error instanceof Interrupt) throw error;
+        if (error.message) warn(error.message);
+        failed.push(row);
+      }
+    }
+    done('Gateway', session.endpoint);
+    done('Key', 'staged');
+    if (failed.length > 0) throw new CliError(`${failed.map(row => row.label).join(', ')} could not be configured; see above`);
+    return true;
+  };
+  return view === null ? runAction(`Apply ${label}`, work) : runProgress(view, `Apply ${label}`, work);
+}
+
+// ── setup ───────────────────────────────────────────────────────────────────
+// The installer's walkthrough: log into prod (URL and key), select it,
+// configure the installed clients for it, then open the dashboard. Rerun any
+// time; a stored login that the gateway still accepts is kept.
+async function setup(flags) {
+  if (!interactive()) throw usage('setup needs a terminal; run genesis login and genesis apply --overwrite instead');
+  const environment = environmentId(flags.environment ?? 'prod');
+  const label = environmentLabel(environment);
+  out(paint('1', `Set up ${label}`));
+  let session = flags.url === undefined ? loadSession(environment) : null;
+  if (session !== null) {
+    try { validateMe(await request(session.endpoint, session.token, 'GET', '/admin/api/cli/me')); done('Logged in', sessionIdentity(session)); } catch (error) {
+      if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
+      warn(`${hostOf(session.endpoint)} no longer accepts the stored key`);
+      session = null;
+    }
+  }
+  if (session === null) session = await login({ environment, url: flags.url });
+  const store = loadStore();
+  if (store.environment !== environment) {
+    if (environment !== 'prod') await requireProdDev();
+    store.environment = environment;
+    writeSessionText(JSON.stringify(store, null, 2) + '\n');
+  }
+  await applyEnvironment(session, flags);
+  return dashboard({ environment });
 }
 async function status(session, flags) {
   header(session);
@@ -1791,7 +1890,7 @@ async function update() {
 async function refreshIdentity(session, view) {
   try {
     const value = await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me'));
-    view.mainDev = session.environment === 'main' && isMainDev(value);
+    view.prodDev = session.environment === 'prod' && isProdDev(value);
     const identity = validateMe(value);
     if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email || identity.identityClass !== session.identityClass) {
       const next = { ...session, ...identity };
@@ -1800,7 +1899,7 @@ async function refreshIdentity(session, view) {
     }
     return session;
   } catch (error) {
-    view.mainDev = false;
+    view.prodDev = false;
     if (error instanceof HttpError && error.status === 401) {
       return null;
     }
@@ -1813,7 +1912,7 @@ async function dashboard(flags) {
   if (!interactive()) throw usage('no terminal; run a command instead (genesis --help)');
   let environment = environmentId(flags.environment ?? loadStore().environment);
   let session = loadSession(environment);
-  let mainDev = false;
+  let prodDev = false;
   const stack = [{ route: 'dashboard', title: 'genesis', selected: 0 }];
   const pendingClosures = new Set();
   const navigation = new AbortController();
@@ -1839,26 +1938,26 @@ async function dashboard(flags) {
     { value: 'enable', label: 'Enable' }, { value: 'disable', label: 'Disable' }, { value: 'unset', label: 'Unset' },
   ];
   const authorizeSecondary = async view => {
-    try { await requireMainDev(view); mainDev = true; } catch (error) {
-      mainDev = false;
-      if (environment !== 'main') session = null;
+    try { await requireProdDev(view); prodDev = true; } catch (error) {
+      prodDev = false;
+      if (environment !== 'prod') session = null;
       throw error;
     }
   };
   if (ansi()) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
   try {
-    if (environment !== 'main') {
+    if (environment !== 'prod') {
       try { await authorizeSecondary(stack[0]); } catch (error) {
         if (error instanceof Interrupt) throw error;
-        push('result', 'Main access');
-        showResult(stack.at(-1), `Failed ${glyph.dot} Main access`, error.message, true);
+        push('result', 'Prod access');
+        showResult(stack.at(-1), `Failed ${glyph.dot} Prod access`, error.message, true);
       }
     }
     if (session !== null) {
       const initial = stack[0];
       const endpoint = session.endpoint;
       session = await refreshIdentity(session, initial);
-      if (environment === 'main') mainDev = initial.mainDev;
+      if (environment === 'prod') prodDev = initial.prodDev;
       if (session === null) {
         push('result', 'Saved login', { endpoint });
         showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`,
@@ -1880,18 +1979,18 @@ async function dashboard(flags) {
         if (view.route === 'login') {
           renderScreen({ ...view, body: '', options: [] });
           session = await login({ environment }, view);
-          if (environment === 'main') {
-            try { await requireMainDev(view); mainDev = true; } catch (error) {
+          if (environment === 'prod') {
+            try { await requireProdDev(view); prodDev = true; } catch (error) {
               if (error instanceof Interrupt) throw error;
-              mainDev = false;
+              prodDev = false;
             }
           }
           delete view.notice;
-          showResult(view, `Complete ${glyph.dot} Log in`);
+          showResult(view, `Complete ${glyph.dot} ${view.title.split(` ${glyph.step} `).at(-1)}`);
           continue;
         }
         if (view.route === 'add') {
-          if (environment !== 'main') await authorizeSecondary(view);
+          if (environment !== 'prod') await authorizeSecondary(view);
           const { cleanup } = await addConnection(session, {}, view);
           const parent = stack.at(-2);
           const closing = cleanup.then(error => {
@@ -1906,23 +2005,26 @@ async function dashboard(flags) {
         }
         if (!view.ready) {
           const prepare = async () => {
-            if (environment !== 'main' && ['model', 'usage', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary();
+            if (environment !== 'prod' && ['model', 'usage', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary();
             if (view.route === 'dashboard') {
-              if (environment === 'main' && session !== null) {
-                try { await requireMainDev(); mainDev = true; } catch (error) {
+              if (environment === 'prod' && session !== null) {
+                try { await requireProdDev(); prodDev = true; } catch (error) {
                   if (error instanceof Interrupt) throw error;
-                  mainDev = false;
+                  prodDev = false;
                 }
               }
               view.body = session === null ? '' : renderStatus(await statusRows(session));
               view.options = [
-                ...(mainDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
-                ...(environment !== 'main' && !mainDev ? [{ value: 'main', label: 'Main' }] : session === null ? [{ value: 'login', label: 'Log in' }] : []),
+                ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
+                ...(environment !== 'prod' && !prodDev ? [{ value: 'prod', label: 'Prod' }] : session === null ? [{ value: 'login', label: 'Log in' }] : []),
+                ...(session === null ? [] : [{ value: 'apply', label: 'Apply', hint: `configure installed clients for ${environmentLabel(environment)}` }]),
                 { value: 'clients', label: 'Clients' },
                 ...(session === null ? [] : [
                   { value: 'usage', label: 'Usage' },
                   ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
                   ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
+                  { value: 'login', label: 'Change key', hint: `${environmentLabel(environment)} gateway URL and key` },
+                  { value: 'logout', label: 'Log out', hint: environmentLabel(environment) },
                 ]),
                 { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
               ];
@@ -1970,17 +2072,17 @@ async function dashboard(flags) {
         if (choice === BACK) { pop(); continue; }
         if (view.route === 'dashboard') {
           const label = view.options.find(option => option.value === choice).label;
-          if (choice === 'main') {
-            session = await selectEnvironment('main');
-            environment = 'main';
+          if (choice === 'prod') {
+            session = await selectEnvironment('prod');
+            environment = 'prod';
             view.ready = false;
             if (session !== null) {
               session = await refreshIdentity(session, view);
-              mainDev = view.mainDev;
+              prodDev = view.prodDev;
             }
             continue;
           }
-          if (choice === 'rotate' || choice === 'update') push('confirm', label, { action: choice, actionLabel: label });
+          if (['rotate', 'update', 'apply', 'logout'].includes(choice)) push('confirm', label, { action: choice, actionLabel: label });
           else push(choice, label);
         } else if (view.route === 'environment') {
           const next = await selectEnvironment(choice, view);
@@ -2002,13 +2104,15 @@ async function dashboard(flags) {
         } else if (view.route === 'confirm') {
           view.body = '';
           await runProgress(view, `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}`, async () => {
-            if (environment !== 'main' && !['update', 'disable'].includes(view.action)) await authorizeSecondary();
+            if (environment !== 'prod' && !['update', 'disable', 'logout'].includes(view.action)) await authorizeSecondary();
             if (view.action === 'rotate') await Promise.all(pendingClosures);
             const flags = { profile: view.row?.profile || undefined, model: view.model, overwrite: true };
             if (view.action === 'configure') await configure(session, view.row.client, flags);
             else if (view.action === 'disable') await switchScope(null, view.row.client, 'disable', flags);
             else if (['enable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
             else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
+            else if (view.action === 'apply') await applyEnvironment(session, flags);
+            else if (view.action === 'logout') { logout({ environment }); session = null; prodDev = false; }
             else if (view.action === 'update') await update();
           });
           showResult(view, `Complete ${glyph.dot} ${view.actionLabel}`);
@@ -2039,9 +2143,11 @@ async function dashboard(flags) {
 const HELP = `Usage: genesis [command] [options]
 
   genesis                                   dashboard
-  environment [main | staging]
+  setup [--url URL]                         log into prod (URL and key), then configure installed clients
+  environment [prod | staging]
   login [--url URL]                         sign in (AGENT_AUTH_TOKEN or a hidden prompt)
   logout
+  apply [--overwrite]                       configure every installed client for the selected environment
   status [--profile P]
   configure <client> [--model ID] [--profile P] [--overwrite]
   disable <client> [--profile P]            local; no login required
@@ -2054,7 +2160,7 @@ const HELP = `Usage: genesis [command] [options]
   update | --update
   --version | --help
 
-Environment override: --environment main | staging (does not change the saved selection)
+Environment override: --environment prod | staging (does not change the saved selection)
 Clients: ${CLIENTS.map(client => client.id).join(', ')}
 Exit codes: 0 ok, 1 failure, 2 usage`;
 const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port']);
@@ -2084,22 +2190,23 @@ async function main(argv) {
   if (flags.environment !== undefined) environmentId(flags.environment);
   if (flags.help || command === 'help') { out(HELP); return; }
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
-  if (flags.url !== undefined && command !== 'login') throw usage('--url is only accepted by login; it never retargets a stored key');
+  if (flags.url !== undefined && !['login', 'setup'].includes(command)) throw usage('--url is only accepted by login and setup; it never retargets a stored key');
   if (flags.json && command !== 'usage') throw usage('--json is only accepted by usage');
   if (flags.update || command === 'update') { await update(); return; }
   const expect = count => { if (rest.length !== count) throw usage(`${command} takes ${count === 0 ? 'no arguments' : `${count} argument${count === 1 ? '' : 's'}`}; see genesis --help`); };
   switch (command) {
     case undefined: await dashboard(flags); return;
+    case 'setup': expect(0); await setup(flags); return;
     case 'environment': {
       const apply = async view => {
-        if (rest.length > 1) throw usage('environment takes main or staging');
+        if (rest.length > 1) throw usage('environment takes prod or staging');
         if (rest.length === 1) {
-          if (flags.environment !== undefined) throw usage('use environment main|staging without --environment to save the selection');
+          if (flags.environment !== undefined) throw usage('use environment prod|staging without --environment to save the selection');
           await selectEnvironment(rest[0], view);
         }
         const store = loadStore();
         const environment = flags.environment ?? store.environment;
-        if (rest.length === 0 && environment !== 'main') await requireMainDev(view);
+        if (rest.length === 0 && environment !== 'prod') await requireProdDev(view);
         out(`${environmentLabel(environment)} ${glyph.dot} ${store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint ?? 'not configured'}`);
       };
       if (rest.length === 0) await apply(null);
@@ -2108,6 +2215,7 @@ async function main(argv) {
     }
     case 'login': expect(0); await runAction('Log in', view => login(flags, view), true); return;
     case 'logout': expect(0); await runAction('Log out', () => logout(flags)); return;
+    case 'apply': expect(0); await applyEnvironment(await requireSession(flags), flags); return;
     case 'status': expect(0); await status(await requireSession(flags), flags); return;
     case 'configure': expect(1); await configure(await requireSession(flags), clientById(rest[0]), flags); return;
     case 'disable': expect(1); await switchScope(null, clientById(rest[0]), command, flags); return;
