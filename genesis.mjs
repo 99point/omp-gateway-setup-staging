@@ -22,6 +22,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const KEY = /^s99dev\.[A-Za-z0-9_-]{20,512}$/;
 const KEY_SHAPE = 'those start with s99dev. followed by 20-512 letters, digits, _ or -';
 const ROLES = new Set(['owner', 'admin', 'viewer', 'client']);
+const IDENTITY_CLASSES = new Set(['internal', 'external']);
 const HTTP_TIMEOUT_MS = 30_000;
 const LINK_POLL_MS = 2_000;
 const LOCAL_BODY_CAP = 16 * 1024;
@@ -204,13 +205,14 @@ function writeSessionText(text) {
 function storedSession(value, environment) {
   const file = sessionFile();
   if (!record(value) || typeof value.endpoint !== 'string' || typeof value.name !== 'string'
-    || !ROLES.has(value.role) || (value.email !== null && typeof value.email !== 'string') || typeof value.updatedAt !== 'string') {
+    || !ROLES.has(value.role) || (value.identityClass !== undefined && !IDENTITY_CLASSES.has(value.identityClass))
+    || (value.email !== null && typeof value.email !== 'string') || typeof value.updatedAt !== 'string') {
     throw new CliError(`${file} is not a genesis session store; remove it and run genesis login`);
   }
   if (!acceptKey(value.token)) throw new CliError(`${file} does not hold a personal gateway key; run genesis login`);
   return {
     endpoint: environmentEndpoint(value.endpoint, environment), name: value.name, role: value.role,
-    email: value.email, token: value.token, updatedAt: value.updatedAt,
+    email: value.email, token: value.token, updatedAt: value.updatedAt, identityClass: value.identityClass ?? 'internal',
   };
 }
 function checkSessionIsolation(store, environment, endpoint, token) {
@@ -882,7 +884,7 @@ export function renderStatus(rows) {
     row.label, row.installed ? 'yes' : 'no', row.status, row.state?.model ?? '—', row.state?.gateway ? hostOf(row.state.gateway) : '—',
   ]));
 }
-const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}`;
+const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}${session.identityClass === 'external' ? ` ${glyph.dot} external` : ''}`;
 const header = session => out(paint('1', sessionIdentity(session)));
 
 // ── installer ───────────────────────────────────────────────────────────────
@@ -995,32 +997,37 @@ const currentModelId = state => (state?.model ? rawModelId(state.model) : null);
 
 // ── renderers ───────────────────────────────────────────────────────────────
 const number = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
-const bars = value => (number(value) === null ? '—' : value.toFixed(2));
+const USAGE_CATEGORIES = [
+  ['input', 'input'], ['cache_write', 'cache write'], ['cache_read', 'cache read'],
+  ['output_completion', 'completion'], ['thinking', 'thinking'], ['total', 'total'],
+  ['cache_write_5m', 'cache write 5m'], ['cache_write_1h', 'cache write 1h'],
+  ['orchestration_input', 'orchestration input'], ['orchestration_cache_read', 'orchestration read'], ['orchestration_output', 'orchestration out'],
+];
 export function renderUsage(payload) {
-  if (!record(payload) || !Array.isArray(payload.barTypes) || !record(payload.windows)
-    || WINDOWS.some(key => !record(payload.windows[key]) || !record(payload.windows[key].tokens) || !record(payload.windows[key].bars))) {
+  const bucket = value => record(value) && record(value.tokens) && record(value.ratesPerDay);
+  if (!record(payload) || !record(payload.windows)
+    || WINDOWS.some(key => !bucket(payload.windows[key]) || !record(payload.windows[key].providers)
+      || Object.values(payload.windows[key].providers).some(value => !bucket(value)))) {
     throw new CliError('the usage payload is not in the expected shape');
   }
-  const types = payload.barTypes.filter(type => record(type) && typeof type.id === 'string' && typeof type.label === 'string');
-  const rows = WINDOWS.map(key => {
+  const count = value => number(value) === null ? '—' : integer(value);
+  const rate = value => number(value) === null ? '—' : amount(value);
+  const renderBucket = (name, value) => {
+    const cost = number(value.cost) === null ? '—' : `$${value.cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    return `${name} ${glyph.dot} ${count(value.calls)} calls ${glyph.dot} ${count(value.errors)} errors ${glyph.dot} ${cost}\n`
+      + table(['category', 'tokens', 'tokens/day'], USAGE_CATEGORIES
+        .filter(([key]) => Object.hasOwn(value.tokens, key))
+        .map(([key, label]) => [label, count(value.tokens[key]), rate(value.ratesPerDay[key])]), new Set([1, 2]));
+  };
+  return WINDOWS.map(key => {
     const window = payload.windows[key];
-    const { tokens } = window;
-    // null counters mean the gateway's recorder checkpoint is unreadable, not
-    // an idle account; null detail means no folded call measured it (write
-    // TTLs are Anthropic-only, reasoning counts Codex-only).
-    const count = value => (number(value) === null ? '—' : integer(value));
-    const prompt = [tokens.input, tokens.cacheRead, tokens.cacheWrite].some(value => number(value) === null)
-      ? null : tokens.input + tokens.cacheRead + tokens.cacheWrite;
-    const ttl = record(tokens.cacheWriteTtl) ? tokens.cacheWriteTtl : null;
-    return [key, ...types.map(type => bars(window.bars[type.id])), count(window.calls),
-      count(prompt), count(tokens.input), count(tokens.cacheRead), count(tokens.cacheWrite),
-      ttl === null ? '—' : `${count(ttl.ephemeral5m)}/${count(ttl.ephemeral1h)}`,
-      count(tokens.output), count(tokens.reasoningTokens),
-      number(window.cost) === null ? '—' : `$${window.cost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`];
-  });
-  const head = ['window', ...types.map(type => `${type.label} bars`), 'calls',
-    'prompt', 'uncached', 'cache read', 'cache write', '5m/1h', 'output', 'reasoning', 'cost'];
-  return table(head, rows, new Set(head.map((_, index) => index).slice(1)));
+    const coverage = payload.coverage?.windows?.[key];
+    const status = coverage?.status === 'unavailable' ? 'unavailable'
+      : coverage?.status === 'partial' ? 'partial history' : '';
+    return [key + (status ? ` ${glyph.dot} ${status}` : ''), renderBucket('all providers', window),
+      ...Object.entries(window.providers).sort(([left], [right]) => left.localeCompare(right))
+        .map(([provider, value]) => renderBucket(provider, value))].join('\n\n');
+  }).join('\n\n');
 }
 export function renderCapacity(payload, nowMs = Date.now()) {
   if (!record(payload) || !Array.isArray(payload.providers)) throw new CliError('the capacity payload is not in the expected shape');
@@ -1076,10 +1083,11 @@ function keyRefusal(endpoint, source, status) {
   return lines.join('\n');
 }
 function validateMe(value) {
-  if (!record(value) || typeof value.name !== 'string' || value.name === '' || !ROLES.has(value.role) || (value.email !== null && typeof value.email !== 'string')) {
+  if (!record(value) || typeof value.name !== 'string' || value.name === '' || !ROLES.has(value.role)
+    || (value.identityClass !== undefined && !IDENTITY_CLASSES.has(value.identityClass)) || (value.email !== null && typeof value.email !== 'string')) {
     throw new CliError('the gateway answered /admin/api/cli/me with an unexpected shape');
   }
-  return { name: value.name, role: value.role, email: value.email };
+  return { name: value.name, role: value.role, email: value.email, identityClass: value.identityClass ?? 'internal' };
 }
 async function reachable(endpoint) {
   try {
@@ -1166,8 +1174,9 @@ async function model(session, client, requested, flags) {
     return configure(session, client, { ...flags, model: choice }, view);
   }, true);
 }
-async function showUsage(session) {
+async function showUsage(session, flags) {
   const payload = await api(session, 'GET', '/admin/api/cli/usage');
+  if (flags.json) { out(JSON.stringify(payload, null, 2)); return; }
   out(paint('1', `usage ${glyph.dot} ${environmentLabel(session.environment)} ${glyph.dot} ${session.name}`));
   out('');
   out(renderUsage(payload));
@@ -1740,7 +1749,7 @@ async function update(flags) {
 async function refreshIdentity(session, view) {
   try {
     const identity = validateMe(await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me')));
-    if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email) {
+    if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email || identity.identityClass !== session.identityClass) {
       const next = { ...session, ...identity };
       saveSession(next);
       return next;
@@ -1949,7 +1958,7 @@ const HELP = `Usage: genesis [command] [options]
   configure <client> [--model ID] [--profile P] [--overwrite]
   enable | disable | unset <client> [--profile P]
   model <client> [ID] [--profile P]         list or pick the client's default model
-  usage                                     your recorded usage
+  usage [--json]                            your recorded usage
   capacity                                  owner/admin
   connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
   token rotate [--yes]                      owner
@@ -1960,7 +1969,7 @@ Environment override: --environment main | staging (does not change the saved se
 Clients: ${CLIENTS.map(client => client.id).join(', ')}
 Exit codes: 0 ok, 1 failure, 2 usage`;
 const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port']);
-const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update']);
+const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json']);
 export function parseArgs(argv) {
   const positionals = [];
   const flags = {};
@@ -1987,6 +1996,7 @@ async function main(argv) {
   if (flags.help || command === 'help') { out(HELP); return; }
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
   if (flags.url !== undefined && command !== 'login') throw usage('--url is only accepted by login; it never retargets a stored key');
+  if (flags.json && command !== 'usage') throw usage('--json is only accepted by usage');
   if (flags.update || command === 'update') { await update(flags); return; }
   const expect = count => { if (rest.length !== count) throw usage(`${command} takes ${count === 0 ? 'no arguments' : `${count} argument${count === 1 ? '' : 's'}`}; see genesis --help`); };
   switch (command) {
@@ -2015,7 +2025,7 @@ async function main(argv) {
       if (rest.length < 1 || rest.length > 2) throw usage('model takes a client and an optional model id; see genesis --help');
       await model(requireSession(flags), clientById(rest[0]), rest[1], flags);
       return;
-    case 'usage': expect(0); await showUsage(requireSession(flags)); return;
+    case 'usage': expect(0); await showUsage(requireSession(flags), flags); return;
     case 'capacity': expect(0); await showCapacity(requireSession(flags)); return;
     case 'connections':
       if (rest.length === 0 || (rest.length === 1 && rest[0] === 'list')) await showConnections(requireSession(flags));
