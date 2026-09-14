@@ -550,42 +550,86 @@ async function confirm(question, defaultYes = false) {
 }
 const BACK = Symbol('back');
 const backOption = { value: BACK, label: 'Back' };
+const clipLine = (text, width) => {
+  const value = String(text);
+  if (value.length <= width) return value;
+  if (width <= 1) return '…'.slice(0, width);
+  return `${value.slice(0, width - 1)}…`;
+};
+// Lines wrap by their visible width: a dimmed table header carries escape
+// codes that must not count, so a line that fits keeps its paint and a line
+// that does not is wrapped as plain text.
+const ANSI_PAINT = /\x1b\[[0-9;]*m/g;
+const wrapLines = (text, width) => String(text ?? '').split('\n').flatMap(line => {
+  if (line === '') return [''];
+  const plain = line.replace(ANSI_PAINT, '');
+  if (plain.length <= width) return [line];
+  const wrapped = [];
+  for (let offset = 0; offset < plain.length; offset += width) wrapped.push(plain.slice(offset, offset + width));
+  return wrapped;
+});
 function renderScreen(view) {
-  const width = Math.max(20, columns() - 1);
+  const width = Math.max(20, columns() - 4);
   const height = Math.max(8, tty().output.rows || 24);
-  const options = view.options;
+  const options = view.options ?? [];
   if (view.selectionOptions !== options) {
     view.selectionOptions = options;
     view.selected = Math.max(0, options.findIndex(option => option.value !== BACK));
-  } else if (!options[view.selected]) view.selected = 0;
-  const body = [view.identity, view.body, view.notice].filter(Boolean).join('\n\n');
-  const lines = redact(body).split('\n').flatMap(line => {
-    const wrapped = [];
-    for (let offset = 0; offset < line.length; offset += width) wrapped.push(line.slice(offset, offset + width));
-    return wrapped.length === 0 ? [''] : wrapped;
-  });
-  const menuRows = Math.min(options.length, Math.max(1, height - 5));
-  const bodyRows = Math.max(0, height - menuRows - 5 - (view.status ? 2 : 0));
-  view.offset = Math.max(0, Math.min(view.offset ?? 0, Math.max(0, lines.length - bodyRows)));
-  const firstOption = Math.max(0, Math.min(view.selected - menuRows + 1, options.length - menuRows));
-  const frame = [ansi() ? '\x1b[H\x1b[2J' : '\f'];
-  const title = redact(view.title);
-  frame.push(`${tint('1', title.length > width ? `…${title.slice(1 - width)}` : title)}\n\n`);
-  if (view.status) frame.push(`${tint(view.failed ? '31' : '36', redact(view.status).slice(0, width))}\n\n`);
-  if (bodyRows > 0 && body) {
-    frame.push(`${lines.slice(view.offset, view.offset + bodyRows).join('\n')}\n`);
-    if (lines.length > bodyRows) frame.push(`${tint('2', `${view.offset + 1}–${Math.min(lines.length, view.offset + bodyRows)}/${lines.length}`)}\n`);
+  } else if (!options[view.selected]) view.selected = Math.max(0, options.length - 1);
+  const renderedBody = Array.isArray(view.statusRows) ? renderStatus(view.statusRows, Math.min(width, 80)) : view.body;
+  const body = [view.identity, renderedBody, view.notice].filter(Boolean).join('\n\n');
+  const bodyLines = wrapLines(redact(body), width);
+  const title = clipLine(redact(view.title), width);
+  const status = view.status ? clipLine(redact(view.status), width) : null;
+  const chrome = [`${tint('1', title)}`, ''];
+  if (status !== null) chrome.push(`${tint(view.failed ? '31' : view.status.startsWith('Complete') ? '32' : '36', status)}`, '');
+  chrome.push(`${tint('1', tint('2', 'Status'))}`);
+  const menuChrome = ['', `${tint('1', tint('2', 'Menu'))}`, ''];
+  const footerKeys = view.root
+    ? (utf8 ? '↑↓ navigate • ⏎ select • esc quit' : '+/- navigate • Enter select • esc quit')
+    : (utf8 ? '↑↓ navigate • ⏎ select • esc back' : '+/- navigate • Enter select • esc back');
+  const footer = `${tint('2', footerKeys)}`;
+  const staticRows = chrome.length + menuChrome.length + 2;
+  const roomForMenu = Math.max(1, height - staticRows);
+  const markerRows = options.length > roomForMenu ? Math.min(2, roomForMenu) : 0;
+  const visibleCount = Math.max(1, roomForMenu - markerRows);
+  const firstOption = options.length <= visibleCount
+    ? 0
+    : Math.max(0, Math.min(view.selected - visibleCount + 1, options.length - visibleCount));
+  const lastOption = Math.min(options.length, firstOption + visibleCount);
+  const labelWidth = options.reduce((longest, option) => Math.max(longest, String(option.label).length), 0);
+  const optionRows = [];
+  for (let index = firstOption; index < lastOption; index++) {
+    const option = options[index];
+    const cursor = index === view.selected ? glyph.pick : ' ';
+    const number = String(index + 1).padStart(2, ' ');
+    const label = String(option.label).padEnd(labelWidth, ' ');
+    const hint = option.hint ? `  ${tint('2', String(option.hint))}` : '';
+    optionRows.push(`${cursor} ${number}  ${label}${hint}`);
   }
+  if (lastOption < options.length) optionRows.push(tint('2', `… ${options.length - lastOption} more`));
+  const menuRows = menuChrome.length + optionRows.length + 1;
+  let bodyRows = Math.max(0, height - chrome.length - menuRows - 2);
+  const bodyOverflow = bodyRows > 0 && bodyLines.length > bodyRows;
+  if (bodyOverflow) bodyRows = Math.max(0, bodyRows - 1);
+  const maxOffset = Math.max(0, bodyLines.length - bodyRows);
+  view.offset = view.offset === Infinity
+    ? maxOffset
+    : Math.max(0, Math.min(view.offset ?? 0, maxOffset));
+  const bodyShown = bodyRows > 0 ? bodyLines.slice(view.offset, view.offset + bodyRows) : [];
+  const bodyFrame = bodyShown;
+  if (bodyOverflow) bodyFrame.push(tint('2', `${view.offset + 1}–${Math.min(bodyLines.length, view.offset + bodyRows)}/${bodyLines.length}`));
+  const margin = line => line === '' ? '' : `  ${line}`;
+  const frame = [ansi() ? '\x1b[H\x1b[2J' : '\f'];
+  frame.push(`${margin(chrome[0])}\n`);
   frame.push('\n');
-  options.slice(firstOption, firstOption + menuRows).forEach((option, offset) => {
-    const index = firstOption + offset;
-    const prefix = `${index === view.selected ? glyph.pick : ' '} ${index + 1}  `;
-    const label = `${prefix}${option.label}`;
-    const hint = option.hint ? `  ${option.hint}` : '';
-    const line = `${label}${hint}`;
-    const clipped = line.length >= width ? `${line.slice(0, width - 2)}…` : line;
-    frame.push(`${index === view.selected ? tint('36', clipped) : clipped}\n`);
-  });
+  if (status !== null) frame.push(`${margin(chrome[2])}\n\n`);
+  // A Status heading with nothing under it is noise: a short pane that gave
+  // every row to the menu shows the menu alone.
+  if (bodyFrame.length > 0) frame.push(`${margin(chrome.at(-1))}\n${bodyFrame.map(margin).join('\n')}\n`);
+  frame.push(`${menuChrome[0]}\n${margin(menuChrome[1])}\n`);
+  for (const row of optionRows) frame.push(`${margin(clipLine(row, width - 2))}\n`);
+  frame.push(`\n${margin(footer)}\n`);
   term(frame.join(''));
 }
 // Rebuilt menus start at their first action. Movement within one options list
@@ -594,8 +638,20 @@ async function selectScreen(view, signal, renderInitial = true) {
   const { input, output } = tty();
   if (signal?.aborted) return BACK;
   let keypress, resize, abort, ended;
+  let pendingTimer = null;
+  let pendingDigit = false;
   try {
     return await new Promise((resolve, reject) => {
+      const settlePending = () => {
+        if (pendingTimer !== null) clearTimeout(pendingTimer);
+        pendingTimer = null;
+        if (pendingDigit) {
+          pendingDigit = false;
+          view.selected = 0;
+          renderScreen(view);
+        }
+      };
+      const selectBack = () => { settlePending(); resolve(BACK); };
       keypress = (text, key) => {
         if (key?.ctrl && key.name === 'c') {
           if (view.interrupt) view.interrupt();
@@ -603,17 +659,45 @@ async function selectScreen(view, signal, renderInitial = true) {
           return;
         }
         if (view.options.length === 0) return;
-        if (key?.name === 'escape' || key?.name === 'left' || (key?.ctrl && key.name === 'd')) { resolve(BACK); return; }
-        if (key?.name === 'return' || key?.name === 'enter') { resolve(view.options[view.selected ?? 0].value); return; }
         const count = view.options.length;
+        const digit = /^[01]$/.test(text ?? '') ? text : null;
+        if (pendingDigit) {
+          if (digit !== null) {
+            if (pendingTimer !== null) clearTimeout(pendingTimer);
+            pendingTimer = null;
+            pendingDigit = false;
+            const selected = Number(`1${digit}`) - 1;
+            if (selected < count) view.selected = selected;
+            else view.selected = 0;
+            renderScreen(view);
+            return;
+          }
+          settlePending();
+        }
+        if (key?.name === 'escape' || key?.name === 'left' || key?.name === 'backspace'
+          || text === '\x7f' || (key?.ctrl && key.name === 'd') || text === 'q' || text === 'Q') {
+          selectBack();
+          return;
+        }
+        if (key?.name === 'return' || key?.name === 'enter') {
+          resolve(view.options[view.selected ?? 0].value);
+          return;
+        }
         if (key?.name === 'up' || text === 'k' || text === 'K') view.selected = ((view.selected ?? 0) + count - 1) % count;
         else if (key?.name === 'down' || text === 'j' || text === 'J') view.selected = ((view.selected ?? 0) + 1) % count;
         else if (key?.name === 'home') view.selected = 0;
         else if (key?.name === 'end') view.selected = count - 1;
         else if (key?.name === 'pageup') view.offset = Math.max(0, (view.offset ?? 0) - 5);
         else if (key?.name === 'pagedown') view.offset = (view.offset ?? 0) + 5;
-        else if (/^[1-9]$/.test(text ?? '') && Number(text) <= count) view.selected = Number(text) - 1;
-        else return;
+        else if (text === '0') return;
+        else if (/^[1-9]$/.test(text ?? '') && Number(text) <= count) {
+          if (text === '1' && count >= 10) {
+            pendingDigit = true;
+            pendingTimer = setTimeout(() => { pendingTimer = null; settlePending(); }, 700);
+            return;
+          }
+          view.selected = Number(text) - 1;
+        } else return;
         renderScreen(view);
       };
       resize = () => renderScreen(view);
@@ -630,6 +714,7 @@ async function selectScreen(view, signal, renderInitial = true) {
       if (renderInitial) renderScreen(view);
     });
   } finally {
+    if (pendingTimer !== null) clearTimeout(pendingTimer);
     input.off('keypress', keypress);
     input.off('end', ended);
     output.off('resize', resize);
@@ -642,7 +727,7 @@ async function selectScreen(view, signal, renderInitial = true) {
 // become an acknowledgement of its result. Prompts run outside this boundary.
 async function runProgress(view, label, work) {
   const running = {
-    title: view.title, identity: view.identity, status: `Running ${glyph.dot} ${label}`, body: '', options: [],
+    title: view.title, root: view.root === true, identity: view.identity, status: `Running ${glyph.dot} ${label}`, body: '', options: [],
     interrupt: () => process.emit('SIGINT'),
   };
   const finished = new AbortController();
@@ -696,9 +781,9 @@ async function runAction(label, work, prompts = false) {
   const view = { title: `genesis ${glyph.step} ${label}` };
   const alternate = ansi() && !terminal.alternateScreen;
   if (alternate) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
+  let result, failure;
   const interrupt = () => { if (activeWork === null) { closeTerminal(); process.exit(130); } };
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, interrupt);
-  let result, failure;
   try {
     try {
       result = await (prompts ? work(view) : runProgress(view, label, () => work(view)));
@@ -710,7 +795,7 @@ async function runAction(label, work, prompts = false) {
         throw error;
       }
       failure = error;
-      showResult(view, `Failed ${glyph.dot} ${label}`, [view.body, error.message || String(error)].filter(Boolean).join('\n\n'), true);
+      showResult(view, `Failed ${glyph.dot} ${label}`, [error.message || String(error), view.body].filter(Boolean).join('\n\n'), true);
     }
     await selectScreen(view);
   } finally {
@@ -916,18 +1001,89 @@ async function statusRows(session, profile) {
   }
   return rows;
 }
-export function renderStatus(rows) {
-  return table(['client', 'installed', 'state', 'model', 'gateway'], rows.map(row => [
+export function renderStatus(rows, maxWidth = Infinity) {
+  const values = rows.map(row => [
     row.label, row.installed ? 'yes' : 'no', row.status, row.state?.model ?? '—', row.state?.gateway ? hostOf(row.state.gateway) : '—',
-  ]));
+  ]);
+  if (Number.isFinite(maxWidth)) {
+    const fixed = Math.max(8, Math.floor((maxWidth - 12 - 9 - 15 - 8) / 2));
+    for (const row of values) {
+      row[3] = clipLine(row[3], fixed);
+      row[4] = clipLine(row[4], fixed);
+    }
+  }
+  return table(['client', 'installed', 'state', 'model', 'gateway'], values);
 }
 const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}${session.identityClass === 'external' ? ` ${glyph.dot} external` : session.identityClass === null ? ` ${glyph.dot} unclassified` : ''}`;
 const header = session => out(paint('1', sessionIdentity(session)));
 
 // ── installer ───────────────────────────────────────────────────────────────
 // AGENT_AUTH_URL/AGENT_AUTH_TOKEN carry the session into the installer; the key
-// never appears on a command line. Its output is relayed through the redactor;
-// its prompts, when any, come from /dev/tty, which it opens itself.
+// never appears on a command line. Its prompts, when any, come from /dev/tty,
+// which it opens itself. Its output is not the terminal's: every line goes,
+// redacted, to the private setup log, and the terminal gets this CLI's own
+// lines — or, with GENESIS_VERBOSE=1, the relayed output as well. A failure
+// names the installer's reason and one next step; the log holds the rest.
+const setupLogFile = () => path.join(configDir(), 'setup.log');
+const verbose = () => process.env.GENESIS_VERBOSE === '1';
+// The installer's stdout and stderr, line by line through redact(), appended
+// under one header per run. Bytes are held until their newline so a key split
+// across chunks is still caught; latin1 keeps every byte as one character.
+function openSetupLog(client, action) {
+  const file = setupLogFile();
+  const directory = path.dirname(file);
+  let fd = null;
+  try {
+    if (checkSessionDir(directory) === null) { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); fs.chmodSync(directory, 0o700); }
+    refuseSymlink(file);
+    fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o600);
+    fs.writeSync(fd, `== ${new Date().toISOString()} ${client.label} ${action}\n`);
+  } catch { fd = null; }
+  const lines = [];
+  const capture = source => {
+    let held = '';
+    source.setEncoding('latin1');
+    const flush = text => {
+      const safe = redact(Buffer.from(text, 'latin1').toString('utf8'));
+      for (const line of safe.split('\n')) if (line !== '') lines.push(line);
+      if (fd !== null) { try { fs.writeSync(fd, safe); } catch { /* The log is best effort. */ } }
+    };
+    source.on('data', chunk => {
+      held += chunk;
+      const cut = held.lastIndexOf('\n') + 1;
+      if (cut === 0) return;
+      flush(held.slice(0, cut));
+      held = held.slice(cut);
+    });
+    source.on('close', () => { if (held !== '') { flush(`${held}\n`); held = ''; } });
+  };
+  return {
+    capture,
+    lines,
+    file: fd === null ? null : file,
+    close() { if (fd !== null) { try { fs.closeSync(fd); } catch { /* Already closed. */ } fd = null; } },
+  };
+}
+// The installer's `setup failed: …` line, or its last line, as one cause.
+function setupCause(lines, code, signal) {
+  const failed = lines.map(line => /^setup failed: (.*)$/.exec(line)).filter(Boolean).at(-1);
+  if (failed) return failed[1].trim();
+  const last = lines.filter(line => line.trim() !== '').at(-1);
+  return last ? last.trim() : `the setup script exited ${code ?? signal} without a reason`;
+}
+// One next step per cause the installer is known to print (setup/*.sh); a
+// cause without a known step stands alone with the log. The model-id refusal
+// is special: the CLI validated that id with the same rule, so the installed
+// setup script's own validator failed to compile (macOS bash before the
+// RE_DUP_MAX fix), and a newer release repairs it.
+function setupNextStep(cause, client) {
+  if (/^model ids are 1-256 printable ASCII characters/.test(cause)) return 'run genesis update, then retry';
+  if (/^could not reach /.test(cause)) return 'check the gateway URL and your network, then retry';
+  if (/is not served by this gateway/.test(cause)) return `pick a served model: genesis model ${client.id}`;
+  if (/^(Node\.js|Python|curl|env) .*is required|^Python jsonschema|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
+  if (/^no OMP protocol works/.test(cause)) return 'update OMP, then retry';
+  return null;
+}
 async function runSetup(session, client, action, args, withToken) {
   const env = { ...process.env };
   delete env.AGENT_AUTH_URL;
@@ -936,14 +1092,40 @@ async function runSetup(session, client, action, args, withToken) {
   delete env.AGENT_AUTH_KEY_CHOICE;
   delete env.AGENT_AUTH_TOKEN;
   if (withToken) env.AGENT_AUTH_TOKEN = session.token;
-  note(`running ${client.label} ${action} setup`);
+  note(`${client.label} ${action}`);
+  const log = openSetupLog(client, action);
   const child = spawnWork('bash', [setupScript(), '--harness', client.id, '--action', action, '--unattended', ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-  relay(child.stdout, process.stdout);
-  relay(child.stderr, process.stderr);
+  log.capture(child.stdout);
+  log.capture(child.stderr);
+  if (verbose()) { relay(child.stdout, process.stdout); relay(child.stderr, process.stderr); }
   const [code, signal] = await once(child, 'close');
+  log.close();
   if (code === 0) return;
   if (signal === 'SIGINT' || code === 130) throw new Interrupt();
-  throw new CliError(`${client.label} ${action} failed (setup exited ${code ?? signal})`);
+  const cause = setupCause(log.lines, code, signal);
+  const next = setupNextStep(cause, client);
+  const version = client.id === 'claude-code' ? await clientVersion(client) : null;
+  throw new CliError([
+    `${client.label} ${action} failed: ${cause}`,
+    ...(version === null ? [] : [`  Installed: ${client.label} ${version}`]),
+    ...(next === null ? [] : [`  Next: ${next}`]),
+    ...(log.file === null ? [] : [`  Details: ${log.file}`]),
+  ].join('\n'));
+}
+// `<binary> --version`, first line, for a failure report; null when the
+// binary does not answer within a few seconds.
+function clientVersion(client) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = value => { if (!settled) { settled = true; resolve(value); } };
+    try {
+      const child = execFile(client.binary, ['--version'], { timeout: 5000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+        const line = String(stdout ?? '').split('\n').find(entry => entry.trim() !== '');
+        finish(error || !line ? null : redact(line.trim()).slice(0, 80));
+      });
+      child.on('error', () => finish(null));
+    } catch { finish(null); }
+  });
 }
 const profileArgs = profile => (profile ? ['--profile', profile] : []);
 function checkProfile(client, profile) {
@@ -991,6 +1173,7 @@ async function configure(session, client, flags, view = null) {
       warn(`Client configured; could not read its saved model: ${error.message}`);
     }
     done('Key', 'staged');
+    done('Run', client.binary);
     return true;
   };
   const label = `Configure ${client.label}`;
@@ -1087,20 +1270,19 @@ export function renderCapacity(payload, nowMs = Date.now()) {
     const eligible = number(provider.eligible) === null ? '—' : `${provider.eligible} / ${number(provider.accounts) ?? '—'}`;
     const reset = countdown(provider.nextResetMs, nowMs);
     const metrics = provider.unavailable === true || !Array.isArray(provider.metrics) ? [] : provider.metrics.filter(record);
-    if (metrics.length === 0) { rows.push([label, 'unavailable', '—', '—', eligible, reset]); continue; }
+    if (metrics.length === 0) { rows.push([label, 'unavailable', '—', '—', '—', eligible, reset]); continue; }
     metrics.forEach((metric, index) => {
       const known = metric.known === true && number(metric.used) !== null && number(metric.total) !== null;
       rows.push([
         index === 0 ? label : '', String(metric.label ?? metric.id),
-        `${known ? amount(metric.used) : '—'} / ${number(metric.total) === null ? '—' : amount(metric.total)}`,
-        known && number(metric.fill) !== null ? percent(metric.fill) : '—',
+        known ? amount(metric.used) : '—',
+        number(metric.total) === null ? '—' : amount(metric.total),
+        known && number(metric.overall) !== null ? percent(metric.overall) : '—',
         index === 0 ? eligible : '', index === 0 ? reset : '',
       ]);
     });
   }
-  const rendered = table(['provider', 'metric', 'bars', 'next bar', 'eligible', 'reset'], rows, new Set([2, 3]));
-  // A view the server is serving from its last good read (a fresh read
-  // failed) is stamped with that read's time, so old numbers never pass as new.
+  const rendered = table(['provider', 'metric', 'used', 'total', 'used %', 'eligible', 'reset'], rows, new Set([2, 3, 4]));
   if (payload.stale === true) {
     const at = number(payload.generatedAt) === null ? null : new Date(payload.generatedAt).toISOString().slice(0, 16).replace('T', ' ');
     return `${rendered}\nstale${at === null ? '' : ` ${glyph.dot} as of ${at}Z`}`;
@@ -1262,16 +1444,19 @@ async function applyEnvironment(session, flags, view = null) {
       try {
         await runSetup(session, row.client, 'configure', ['--new-key', '--overwrite', ...model, ...profile], true);
         if (row.state?.mode === 'disabled') await runSetup(session, row.client, 'disable', profile, false);
-        done('Configured', row.state?.mode === 'disabled' ? `${row.label} ${glyph.dot} disabled` : row.label);
+        done('Configured', `${row.label}${model.length > 0 ? ` ${glyph.dot} ${model[1]}` : ''}${row.state?.mode === 'disabled' ? ` ${glyph.dot} disabled` : ''}`);
       } catch (error) {
         if (error instanceof Interrupt) throw error;
         if (error.message) warn(error.message);
         failed.push(row);
       }
     }
+    if (failed.length > 0) {
+      throw new CliError(`${failed.length} of ${rows.length} clients not configured: ${failed.map(row => row.label).join(', ')}`
+        + `${rows.length > failed.length ? `\n  Configured: ${rows.filter(row => !failed.includes(row)).map(row => row.label).join(', ')}` : ''}`);
+    }
     done('Gateway', session.endpoint);
     done('Key', 'staged');
-    if (failed.length > 0) throw new CliError(`${failed.map(row => row.label).join(', ')} could not be configured; see above`);
     return true;
   };
   return view === null ? runAction(`Apply ${label}`, work) : runProgress(view, `Apply ${label}`, work);
@@ -1343,6 +1528,159 @@ async function showCapacity(session) {
 }
 async function showConnections(session) {
   out(renderConnections(await api(session, 'GET', '/admin/api/cli/connections')));
+}
+const SMOKE_PROMPT = 'Reply with exactly: pong';
+const SMOKE_ROUTES = { anthropic: '/anthropic/v1/messages', 'openai-codex': '/openai-codex/v1/responses' };
+const SMOKE_TERMINAL = { anthropic: 'message_stop', 'openai-codex': 'response.completed' };
+const smokeRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function smokeSse(text) {
+  return String(text).split(/\r?\n\r?\n/).flatMap(block => {
+    let event = null;
+    const data = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).trim());
+    }
+    if (data.length === 0) return [];
+    let value = null;
+    try { value = JSON.parse(data.join('\n')); } catch { value = null; }
+    return [{ event: event ?? value?.type ?? null, value }];
+  });
+}
+function smokeModel(catalog, provider) {
+  if (!smokeRecord(catalog) || !Array.isArray(catalog.data)) throw new CliError('the gateway model catalog is not in the expected shape');
+  const choices = catalog.data.filter(card => smokeRecord(card) && card.owned_by === provider && typeof card.id === 'string'
+    && MODEL_ID.test(typeof card.request_model_id === 'string' ? card.request_model_id : rawModelId(card.id)));
+  choices.sort((left, right) => {
+    const price = card => smokeRecord(card.cost) && Number.isFinite(card.cost.input) && Number.isFinite(card.cost.output)
+      ? card.cost.input + card.cost.output : Infinity;
+    return price(left) - price(right);
+  });
+  if (choices.length === 0) return null;
+  const card = choices[0];
+  return typeof card.request_model_id === 'string' ? card.request_model_id : rawModelId(card.id);
+}
+function smokeHealth(value) {
+  if (!smokeRecord(value) || value.ok !== true) throw new CliError('gateway is not ready');
+  const ready = value.ready === false ? 'not ready' : 'ready';
+  const workers = Number.isFinite(value.workers) ? value.workers : Number.isFinite(value.workerCount) ? value.workerCount : '—';
+  const admission = value.admission === 'held' ? 'held' : 'accepting';
+  return `ok ${glyph.dot} ${ready} ${glyph.dot} workers ${workers} ${glyph.dot} admission ${admission}`;
+}
+function smokeModels(catalog) {
+  if (!smokeRecord(catalog) || !Array.isArray(catalog.data)) throw new CliError('the gateway model catalog is not in the expected shape');
+  const counts = Object.fromEntries(Object.keys(SMOKE_ROUTES).map(provider => [provider, 0]));
+  for (const card of catalog.data) if (smokeRecord(card) && Object.hasOwn(counts, card.owned_by)) counts[card.owned_by] += 1;
+  const served = catalog.data.filter(card => smokeRecord(card) && typeof card.id === 'string');
+  return { detail: `${served.length} served ${glyph.dot} anthropic ${counts.anthropic} ${glyph.dot} openai-codex ${counts['openai-codex']}`, counts };
+}
+async function smokeCall(session, provider, model) {
+  const endpoint = session.endpoint;
+  const headers = { Accept: 'text/event-stream', Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' };
+  const body = provider === 'anthropic'
+    ? { model, max_tokens: 8, stream: true, messages: [{ role: 'user', content: SMOKE_PROMPT }] }
+    : { model, stream: true, store: false, instructions: SMOKE_PROMPT, input: [{ role: 'user', content: [{ type: 'input_text', text: SMOKE_PROMPT }] }] };
+  const deadline = requestDeadline(HTTP_TIMEOUT_MS);
+  const started = performance.now();
+  let response;
+  try {
+    try {
+      response = await fetch(`${endpoint}${SMOKE_ROUTES[provider]}`, {
+        method: 'POST', headers, body: JSON.stringify(body), redirect: 'manual', signal: deadline.signal,
+      });
+    } catch (error) {
+      throw new CliError(`could not reach ${hostOf(endpoint)}: ${reasonOf(error)}`);
+    }
+    // First text is the wall time of the first visible delta as the stream
+    // arrives, not the end of the body.
+    const isText = entry => (provider === 'anthropic'
+      ? entry.event === 'content_block_delta' && typeof entry.value?.delta?.text === 'string'
+      : entry.event === 'response.output_text.delta' && typeof entry.value?.delta === 'string');
+    let text = '';
+    let firstAt = null;
+    if (response.body !== null) {
+      const decoder = new TextDecoder();
+      for await (const chunk of response.body) {
+        text += decoder.decode(chunk, { stream: true });
+        if (firstAt === null && smokeSse(text).some(isText)) firstAt = performance.now();
+      }
+      text += decoder.decode();
+    }
+    const events = smokeSse(text);
+    let errorBody = null;
+    try { errorBody = JSON.parse(text || '{}'); } catch { errorBody = null; }
+    if (!response.ok) throw new CliError(`HTTP ${response.status}: ${smokeRecord(errorBody) && typeof errorBody.error === 'string' ? errorBody.error : 'request failed'}`);
+    const terminalEvent = events.at(-1)?.event;
+    if (terminalEvent !== SMOKE_TERMINAL[provider]) throw new CliError(`stream ended with ${terminalEvent ?? 'no event'}, not ${SMOKE_TERMINAL[provider]}`);
+    const reply = provider === 'anthropic'
+      ? events.filter(entry => entry.event === 'content_block_delta').map(entry => entry.value?.delta?.text ?? '').join('')
+      : events.filter(entry => entry.event === 'response.output_text.delta').map(entry => entry.value?.delta ?? '').join('');
+    const lastValue = events.at(-1)?.value;
+    const usage = provider === 'anthropic'
+      ? {
+        input: events.find(entry => entry.event === 'message_start')?.value?.message?.usage?.input_tokens ?? null,
+        output: events.find(entry => entry.event === 'message_delta')?.value?.usage?.output_tokens ?? null,
+      }
+      : {
+        input: lastValue?.response?.usage?.input_tokens ?? null,
+        output: lastValue?.response?.usage?.output_tokens ?? null,
+      };
+    if (provider === 'openai-codex' && lastValue?.response?.status !== 'completed') throw new CliError('response.completed did not report completed');
+    const total = performance.now() - started;
+    const first = firstAt === null ? null : firstAt - started;
+    return {
+      status: response.status,
+      first, total, terminal: terminalEvent, reply: reply.trim().slice(0, 60),
+      input: usage.input, output: usage.output,
+    };
+  } finally { deadline.close(); }
+}
+const smokeSeconds = value => value === null ? '—' : `${(value / 1000).toFixed(1)}s`;
+const smokeTokens = value => Number.isFinite(value) ? String(value) : '—';
+async function smoke(session, flags, view = null) {
+  const execute = async () => {
+    const checks = [];
+    const add = async (name, work, format) => {
+      const started = performance.now();
+      try {
+        const value = await work();
+        const check = { name, ok: true, ms: Math.round(performance.now() - started), detail: format(value) };
+        checks.push(check);
+        if (!flags.json) done(name, check.detail);
+      } catch (error) {
+        const detail = error instanceof CliError ? error.message : String(error?.message ?? error);
+        checks.push({ name, ok: false, ms: Math.round(performance.now() - started), detail });
+        if (!flags.json) warn(`${name}  ${detail}`);
+      }
+      return checks.at(-1);
+    };
+    const health = await add('health', () => request(session.endpoint, null, 'GET', '/healthz'), smokeHealth);
+    const login = await add('login', () => api(session, 'GET', '/admin/api/cli/me'), value => {
+      const identity = validateMe(value);
+      return `${identity.name} ${glyph.dot} ${identity.role} ${glyph.dot} ${identity.identityClass ?? 'unclassified'}`;
+    });
+    let catalog = null;
+    const models = await add('models', async () => {
+      catalog = await api(session, 'GET', '/v1/models');
+      return smokeModels(catalog);
+    }, value => value.detail);
+    if (models.ok) {
+      for (const provider of Object.keys(SMOKE_ROUTES)) {
+        const model = smokeModel(catalog, provider);
+        if (model === null) continue;
+        await add(provider, () => smokeCall(session, provider, model), value =>
+          `${model} ${glyph.dot} HTTP ${value.status} ${glyph.dot} first text ${smokeSeconds(value.first)} ${glyph.dot} total ${smokeSeconds(value.total)} ${glyph.dot} terminal ${value.terminal} ${glyph.dot} "${value.reply}" ${glyph.dot} ${smokeTokens(value.input)}/${smokeTokens(value.output)} tokens`);
+      }
+    }
+    const passed = checks.filter(check => check.ok).length;
+    if (!flags.json) out(`${passed} of ${checks.length} checks passed`);
+    const report = { environment: session.environment, endpoint: session.endpoint, ok: passed === checks.length, checks };
+    return report;
+  };
+  const report = view === null || flags.json ? await execute() : await runProgress(view, 'Smoke', execute);
+  if (flags.json) out(JSON.stringify(report, null, 2));
+  if (!report.ok) throw new CliError(`${report.checks.filter(check => !check.ok).length} of ${report.checks.length} checks failed`);
+  return report;
 }
 
 // ── add connection ──────────────────────────────────────────────────────────
@@ -1926,7 +2264,7 @@ async function dashboard(flags) {
   let environment = environmentId(flags.environment ?? loadStore().environment);
   let session = loadSession(environment);
   let prodDev = false;
-  const stack = [{ route: 'dashboard', title: 'genesis', selected: 0 }];
+  const stack = [{ route: 'dashboard', title: 'genesis', selected: 0, root: true, ready: false }];
   const pendingClosures = new Set();
   const navigation = new AbortController();
   let activeView = null;
@@ -1939,13 +2277,23 @@ async function dashboard(flags) {
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', interrupt);
   const push = (route, label, fields = {}) => stack.push({
-    route, title: `${stack.at(-1).title} ${glyph.step} ${label}`, selected: 0, ...fields,
+    route, title: `${stack.at(-1).title} ${glyph.step} ${label}`, selected: 0, ready: false, ...fields,
   });
-  const pop = () => {
+  // Read-only pages keep a prepared parent in memory. A mutation invalidates
+  // every ancestor so that a client list never displays state from before an
+  // action was acknowledged.
+  const pop = (mutating = false) => {
     stack.pop();
+    if (mutating) for (const parent of stack) parent.ready = false;
+    // The menu returned to starts at its first action again; only its data
+    // is kept.
     const parent = stack.at(-1);
-    if (parent !== undefined) parent.ready = false;
+    if (parent !== undefined) parent.selectionOptions = null;
   };
+  // The main menu depends on who is logged in where: it is rebuilt whenever
+  // that changed underneath a prepared screen (a child's Main recheck can
+  // drop the session), not only after an acknowledged mutation.
+  const stateKey = () => `${environment}\u0000${session?.token ?? ''}\u0000${session?.role ?? ''}\u0000${prodDev}`;
   const actions = [
     { value: 'configure', label: 'Configure' }, { value: 'model', label: 'Model' },
     { value: 'enable', label: 'Enable' }, { value: 'disable', label: 'Disable' }, { value: 'unset', label: 'Unset' },
@@ -1975,8 +2323,7 @@ async function dashboard(flags) {
         push('result', 'Saved login', { endpoint });
         showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`,
           `${hostOf(endpoint)} no longer accepts the stored key; log in again`, true);
-      }
-      else if (initial.notice) {
+      } else if (initial.notice) {
         push('result', 'Connection error');
         showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`, initial.notice, true);
         delete initial.notice;
@@ -1992,6 +2339,7 @@ async function dashboard(flags) {
         if (view.route === 'login') {
           renderScreen({ ...view, body: '', options: [] });
           session = await login({ environment }, view);
+          view.mutating = true;
           if (environment === 'prod') {
             try { await requireProdDev(view); prodDev = true; } catch (error) {
               if (error instanceof Interrupt) throw error;
@@ -2016,36 +2364,48 @@ async function dashboard(flags) {
           pop();
           continue;
         }
+        if (view.route === 'smoke') {
+          view.body = '';
+          await smoke(session, {}, view);
+          showResult(view, `Complete ${glyph.dot} Smoke`);
+          continue;
+        }
+        if (view.route === 'dashboard' && view.ready && view.stateKey !== stateKey()) view.ready = false;
         if (!view.ready) {
           const prepare = async () => {
-            if (environment !== 'prod' && ['model', 'usage', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary();
+            if (environment !== 'prod' && ['model', 'usage', 'capacity', 'connections', 'smoke'].includes(view.route)) await authorizeSecondary();
             if (view.route === 'dashboard') {
-              if (environment === 'prod' && session !== null) {
-                try { await requireProdDev(); prodDev = true; } catch (error) {
-                  if (error instanceof Interrupt) throw error;
-                  prodDev = false;
-                }
-              }
-              view.body = session === null ? '' : renderStatus(await statusRows(session));
-              view.options = [
-                ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
-                ...(environment !== 'prod' && !prodDev ? [{ value: 'prod', label: 'Prod' }] : session === null ? [{ value: 'login', label: 'Log in' }] : []),
-                ...(session === null ? [] : [{ value: 'apply', label: 'Apply', hint: `configure installed clients for ${environmentLabel(environment)}` }]),
-                { value: 'clients', label: 'Clients' },
-                ...(session === null ? [] : [
-                  { value: 'usage', label: 'Usage' },
+              // refreshIdentity() is the sole /me read for this dashboard.
+              // In particular, do not turn a prepared main menu into a
+              // second network request just to decide whether Environment fits.
+              const rows = session === null ? null : await statusRows(session);
+              view.statusRows = rows;
+              view.body = rows === null ? '' : renderStatus(rows);
+              view.options = session === null
+                ? [
+                  ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
+                  ...(environment !== 'prod' && !prodDev ? [{ value: 'prod', label: 'Prod' }] : [{ value: 'login', label: 'Log in' }]),
+                  { value: 'clients', label: 'Clients' }, { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
+                ]
+                : [
+                  ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
+                  { value: 'apply', label: 'Apply', hint: `configure installed clients for ${environmentLabel(environment)}` },
+                  { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
                   ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
-                  ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
-                  { value: 'login', label: 'Change key', hint: `${environmentLabel(environment)} gateway URL and key` },
-                  { value: 'logout', label: 'Log out', hint: environmentLabel(environment) },
-                ]),
-                { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
-              ];
+                  { value: 'smoke', label: 'Smoke', hint: 'health · login · models · one real call per provider' },
+                  { value: 'key', label: 'Key', hint: 'rotate · change gateway URL or key' },
+                  { value: 'logout', label: 'Log out' }, { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
+                ];
             } else if (view.route === 'environment') {
               await authorizeSecondary(view);
               view.options = [...Object.entries(ENVIRONMENTS).map(([value, entry]) => ({
                 value, label: entry.label, hint: value === environment ? 'current' : undefined,
               })), backOption];
+            } else if (view.route === 'key') {
+              view.options = [
+                ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
+                { value: 'login', label: 'Change key' }, backOption,
+              ];
             } else if (view.route === 'clients') {
               view.options = [...(await statusRows(session)).map(row => ({
                 value: row, label: row.label,
@@ -2055,7 +2415,8 @@ async function dashboard(flags) {
               view.options = [...(session === null ? actions.filter(action => action.value === 'disable') : actions), backOption];
               const row = (await statusRows(session, view.row.profile || undefined)).find(entry => entry.client.id === view.row.client.id && entry.profile === view.row.profile);
               if (row !== undefined) view.row = row;
-              view.body = renderStatus([view.row]);
+              view.statusRows = [view.row];
+              view.body = renderStatus(view.statusRows);
             } else if (view.route === 'model') {
               const models = servedModels(await api(session, 'GET', '/v1/models'), view.row.client);
               const current = currentModelId(readState((await resolveScope(view.row.client, view.row.profile || undefined)).stateFile, view.row.client.id));
@@ -2069,6 +2430,8 @@ async function dashboard(flags) {
             } else if (view.route === 'connections') {
               view.body = renderConnections(await api(session, 'GET', '/admin/api/cli/connections'));
               view.options = [...(session.role === 'owner' ? [{ value: 'add', label: 'Add connection' }] : []), backOption];
+            } else if (view.route === 'smoke') {
+              view.options = [];
             } else if (view.route === 'confirm') {
               view.options = [{ value: 'apply', label: view.actionLabel }, backOption];
             }
@@ -2077,12 +2440,13 @@ async function dashboard(flags) {
             await runProgress(view, `Loading ${view.title.split(` ${glyph.step} `).at(-1)}`, prepare);
           } else await prepare();
           view.ready = true;
+          view.stateKey = stateKey();
         }
         activeView = view;
         let choice;
         try { choice = await selectScreen(view, navigation.signal); } finally { activeView = null; }
         if (navigation.signal.aborted) throw new Interrupt();
-        if (choice === BACK) { pop(); continue; }
+        if (choice === BACK) { pop(view.mutating === true); continue; }
         if (view.route === 'dashboard') {
           const label = view.options.find(option => option.value === choice).label;
           if (choice === 'prod') {
@@ -2095,23 +2459,28 @@ async function dashboard(flags) {
             }
             continue;
           }
-          if (['rotate', 'update', 'apply', 'logout'].includes(choice)) push('confirm', label, { action: choice, actionLabel: label });
-          else push(choice, label);
+          if (['apply', 'logout', 'update'].includes(choice)) push('confirm', label, { action: choice, actionLabel: label, mutating: true });
+          else if (choice === 'key' || choice === 'smoke') push(choice, label);
+          else push(choice, label, { mutating: choice === 'login' });
         } else if (view.route === 'environment') {
           const next = await selectEnvironment(choice, view);
           environment = choice;
           session = next;
           view.identity = session === null ? `${environmentLabel(environment)} ${glyph.dot} not logged in` : sessionIdentity(session);
+          view.mutating = true;
           showResult(view, `Complete ${glyph.dot} Environment selected`,
             `${environmentLabel(environment)}\nGateway ${session?.endpoint ?? ENVIRONMENTS[environment].endpoint}\n${session === null ? 'Not logged in' : `Logged in as ${session.name}`}\nClient configurations unchanged`);
+        } else if (view.route === 'key') {
+          if (choice === 'rotate') push('confirm', 'Rotate my key', { action: 'rotate', actionLabel: 'Rotate my key', mutating: true });
+          else if (choice === 'login') push('login', 'Change key', { mutating: true });
         } else if (view.route === 'clients') {
           push('actions', choice.label, { row: choice });
         } else if (view.route === 'actions') {
           const label = actions.find(action => action.value === choice).label;
           if (choice === 'model') push('model', label, { row: view.row });
-          else push('confirm', label, { row: view.row, action: choice, actionLabel: label });
+          else push('confirm', label, { row: view.row, action: choice, actionLabel: label, mutating: true });
         } else if (view.route === 'model') {
-          push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice });
+          push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice, mutating: true });
         } else if (view.route === 'connections') {
           push('add', 'Add connection');
         } else if (view.route === 'confirm') {
@@ -2128,18 +2497,19 @@ async function dashboard(flags) {
             else if (view.action === 'logout') { logout({ environment }); session = null; if (environment === 'prod') prodDev = false; }
             else if (view.action === 'update') await update();
           });
-          showResult(view, `Complete ${glyph.dot} ${view.actionLabel}`);
+          showResult(view, `Complete ${glyph.dot} ${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}`);
         }
       } catch (error) {
         if (error instanceof Interrupt) {
           if (view.body) {
-            showResult(view, `Interrupted ${glyph.dot} ${view.actionLabel ?? view.title.split(` ${glyph.step} `).at(-1)}`);
+            showResult(view, `Interrupted ${glyph.dot} ${view.actionLabel ? `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}` : view.title.split(` ${glyph.step} `).at(-1)}`);
             interruptedView = view;
           }
           throw error;
         }
-        showResult(view, `Failed ${glyph.dot} ${view.actionLabel ?? view.title.split(` ${glyph.step} `).at(-1)}`,
-          [view.body, error.message || String(error)].filter(Boolean).join('\n\n'), true);
+        const resultLabel = view.actionLabel ? `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}` : view.title.split(` ${glyph.step} `).at(-1);
+        showResult(view, `Failed ${glyph.dot} ${resultLabel}`,
+          [error.message || String(error), view.body].filter(Boolean).join('\n\n'), true);
       }
     }
   } finally {
@@ -2169,6 +2539,7 @@ const HELP = `Usage: genesis [command] [options]
   usage [--json]                            your recorded usage
   capacity                                  owner/admin
   connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
+  smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
   token rotate [--yes]                      owner
   update | --update
   --version | --help
@@ -2204,7 +2575,7 @@ async function main(argv) {
   if (flags.help || command === 'help') { out(HELP); return; }
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
   if (flags.url !== undefined && !['login', 'setup'].includes(command)) throw usage('--url is only accepted by login and setup; it never retargets a stored key');
-  if (flags.json && command !== 'usage') throw usage('--json is only accepted by usage');
+  if (flags.json && !['usage', 'smoke'].includes(command)) throw usage('--json is only accepted by usage and smoke');
   if (flags.update || command === 'update') { await update(); return; }
   const expect = count => { if (rest.length !== count) throw usage(`${command} takes ${count === 0 ? 'no arguments' : `${count} argument${count === 1 ? '' : 's'}`}; see genesis --help`); };
   switch (command) {
@@ -2244,6 +2615,13 @@ async function main(argv) {
       else if (rest[0] === 'add' && rest.length === 1) await addConnection(await requireSession(flags), flags);
       else throw usage('connections takes list or add; see genesis --help');
       return;
+    case 'smoke': {
+      expect(0);
+      const session = await requireSession(flags);
+      if (interactive() && !flags.json) await runAction('Smoke', view => smoke(session, flags, view));
+      else await smoke(session, flags);
+      return;
+    }
     case 'token':
       if (rest.length !== 1 || rest[0] !== 'rotate') throw usage('token takes rotate; see genesis --help');
       await rotateToken(await requireSession(flags), flags);
