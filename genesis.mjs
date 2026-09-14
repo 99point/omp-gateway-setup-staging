@@ -35,9 +35,10 @@ const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
 const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
+const MAIN_ENDPOINT = 'https://genesis.99point.co';
 const ENVIRONMENTS = Object.freeze({
-  main: { label: 'Main', endpoint: 'https://genesis.99point.co' },
-  staging: { label: 'Staging', endpoint: 'https://genesis-staging.99point.co' },
+  main: { label: 'Main', endpoint: MAIN_ENDPOINT },
+  staging: { label: 'Staging' },
 });
 function environmentId(value) {
   if (typeof value !== 'string' || !Object.hasOwn(ENVIRONMENTS, value)) throw usage('environment must be main or staging');
@@ -218,7 +219,10 @@ function storedSession(value, environment) {
 }
 function checkSessionIsolation(store, environment, endpoint, token) {
   for (const [other, session] of Object.entries(store.sessions)) {
-    if (other === environment) continue;
+    if (other === environment) {
+      if (session.endpoint !== endpoint && session.token === token) throw new CliError(`${endpoint} needs its own key; the supplied key belongs to ${session.endpoint}`);
+      continue;
+    }
     if (session.endpoint === endpoint) throw new CliError(`${environmentLabel(environment)} needs its own gateway; ${endpoint} belongs to ${environmentLabel(other)}`);
     if (session.token === token) throw new CliError(`${environmentLabel(environment)} needs its own key; the supplied key belongs to ${environmentLabel(other)}`);
   }
@@ -230,7 +234,7 @@ function loadStore() {
   let value;
   try { value = JSON.parse(text); } catch { throw new CliError(`${file} is not valid JSON; remove it and run genesis login`); }
   if (record(value) && value.version === 1) {
-    const environment = canonicalEnvironment(value.endpoint) ?? 'main';
+    const environment = environmentEndpoint(value.endpoint) === MAIN_ENDPOINT ? 'main' : 'staging';
     const session = storedSession(value, environment);
     const store = { version: 2, environment, sessions: { [environment]: session } };
     writeSessionText(JSON.stringify(store, null, 2) + '\n');
@@ -256,11 +260,17 @@ function saveSession(session) {
   store.sessions[session.environment] = storedSession({ ...session, updatedAt: new Date().toISOString() }, session.environment);
   writeSessionText(JSON.stringify(store, null, 2) + '\n');
 }
-function selectEnvironment(environment) {
+async function selectEnvironment(environment, view = null) {
   environmentId(environment);
+  let session = loadSession(environment);
+  if (environment !== 'main') {
+    if (session === null) session = await login({ environment }, view);
+    else await requireMainDev(view);
+  }
   const store = loadStore();
   store.environment = environment;
   writeSessionText(JSON.stringify(store, null, 2) + '\n');
+  return session;
 }
 // Logout keeps the selected environment and the other login, never client files.
 function clearSession(environment) {
@@ -272,9 +282,12 @@ function clearSession(environment) {
   }
   return selected;
 }
-function requireSession(flags) {
+async function requireSession(flags) {
   const store = loadStore();
   const environment = environmentId(flags.environment ?? store.environment);
+  if (environment !== 'main') {
+    await runAction('Main access', async view => { await requireMainDev(view); return false; }, true);
+  }
   const session = store.sessions[environment];
   if (session === undefined) throw new CliError(`${environmentLabel(environment)} is not logged in; run genesis login --environment ${environment}`);
   return { environment, ...session };
@@ -298,19 +311,15 @@ export function normalizeEndpoint(input) {
   if (value.startsWith('http://')) return { error: 'cleartext http:// is accepted only for localhost; use https://' };
   return { error: 'use https://HOST (or a bare host); other schemes are not gateways' };
 }
-function canonicalEnvironment(endpoint) {
-  let url;
-  try { url = new URL(endpoint); } catch { return null; }
-  const hostname = url.hostname.toLowerCase().replace(/\.$/, '');
-  return Object.keys(ENVIRONMENTS).find(environment => hostname === new URL(ENVIRONMENTS[environment].endpoint).hostname) ?? null;
-}
 function environmentEndpoint(input, environment) {
   const result = normalizeEndpoint(input);
   if (result.error !== undefined) throw usage(result.error);
   let endpoint;
   try { endpoint = new URL(result.value).href.replace(/\/+$/, ''); } catch { throw usage('the gateway URL is invalid'); }
-  const canonical = canonicalEnvironment(endpoint);
-  if (canonical !== null && canonical !== environment) throw usage(`${endpoint} is ${environmentLabel(canonical)}, not ${environmentLabel(environment)}`);
+  if (environment === 'main' && endpoint !== MAIN_ENDPOINT) throw usage(`Main is fixed at ${MAIN_ENDPOINT}; use login --environment staging --url URL for another gateway`);
+  if (environment === 'staging' && new URL(endpoint).hostname.toLowerCase().replace(/\.$/, '') === new URL(MAIN_ENDPOINT).hostname) {
+    throw usage(`${endpoint} is Main, not Staging`);
+  }
   return endpoint;
 }
 
@@ -876,7 +885,7 @@ async function statusRows(session, profile) {
       } catch (error) { problem = error.message; }
       rows.push({
         client, profile: scopeProfile, state, installed: isInstalled, problem,
-        status: problem ?? scopeStatus(state, isInstalled, session.endpoint),
+        status: problem ?? scopeStatus(state, isInstalled, session?.endpoint ?? state?.gateway),
         label: scopeProfile ? `${client.label} (${scopeProfile})` : client.label,
       });
     }
@@ -896,7 +905,9 @@ const header = session => out(paint('1', sessionIdentity(session)));
 // never appears on a command line. Its output is relayed through the redactor;
 // its prompts, when any, come from /dev/tty, which it opens itself.
 async function runSetup(session, client, action, args, withToken) {
-  const env = { ...process.env, AGENT_AUTH_URL: session.endpoint };
+  const env = { ...process.env };
+  delete env.AGENT_AUTH_URL;
+  if (session !== null) env.AGENT_AUTH_URL = session.endpoint;
   delete env.AUTH_GATEWAY_TOKEN;
   delete env.AGENT_AUTH_KEY_CHOICE;
   delete env.AGENT_AUTH_TOKEN;
@@ -964,6 +975,10 @@ async function configure(session, client, flags, view = null) {
 async function switchScope(session, client, action, flags) {
   checkProfile(client, flags.profile);
   return runAction(`${action} ${client.label}`, async () => {
+    if (action === 'enable') {
+      const state = readState((await resolveScope(client, flags.profile)).stateFile, client.id);
+      if (state?.gateway && state.gateway !== MAIN_ENDPOINT) await requireMainDev();
+    }
     await runSetup(session, client, action, profileArgs(flags.profile), false);
     done({ enable: 'Enabled', disable: 'Disabled', unset: 'Unset' }[action], flags.profile ? `${client.label} (${flags.profile})` : client.label);
   });
@@ -1093,6 +1108,23 @@ function validateMe(value) {
   }
   return { name: value.name, role: value.role, email: value.email, identityClass: identityClassOf(value.identityClass) };
 }
+const isMainDev = identity => identity?.identityClass === 'internal' && ['owner', 'admin'].includes(identity.role);
+async function requireMainDev(view = null) {
+  const main = loadSession('main');
+  if (main === null) throw new CliError('Main login required for another gateway; run genesis login --environment main first');
+  const check = async () => {
+    let identity;
+    try { identity = await request(MAIN_ENDPOINT, main.token, 'GET', '/admin/api/cli/me'); } catch (error) {
+      if (error instanceof HttpError && [401, 403].includes(error.status)) {
+        throw new CliError('Main no longer accepts the stored key; run genesis login --environment main again');
+      }
+      throw error;
+    }
+    validateMe(identity);
+    if (!isMainDev(identity)) throw new CliError('Another gateway requires an internal Main owner or admin');
+  };
+  return view === null || screenOutput !== null ? check() : runProgress(view, 'Checking Main access', check);
+}
 async function reachable(endpoint) {
   try {
     await request(endpoint, null, 'GET', '/healthz', undefined, 20_000);
@@ -1104,8 +1136,17 @@ async function reachable(endpoint) {
 }
 export async function login(flags, view = null) {
   const store = loadStore();
-  const environment = environmentId(flags.environment ?? store.environment);
-  const endpoint = environmentEndpoint(flags.url ?? store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint, environment);
+  const supplied = flags.url === undefined ? undefined : environmentEndpoint(flags.url);
+  const environment = environmentId(flags.environment ?? (supplied === undefined ? store.environment : supplied === MAIN_ENDPOINT ? 'main' : 'staging'));
+  let endpoint = supplied ?? store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint;
+  if (endpoint !== undefined) endpoint = environmentEndpoint(endpoint, environment);
+  if (environment !== 'main') await requireMainDev(view);
+  if (endpoint === undefined) {
+    if (!interactive()) throw usage('Staging is not configured; run genesis login --environment staging --url URL with its own AGENT_AUTH_TOKEN');
+    endpoint = await ask('Staging gateway URL', value => {
+      try { return { value: environmentEndpoint(value, environment) }; } catch (error) { return { error: error.message }; }
+    }, 'Gateway');
+  }
   let token = process.env.AGENT_AUTH_TOKEN ?? '';
   if (token !== '' && interactive() && Object.entries(store.sessions).some(([other, session]) => other !== environment && session.token === token)) token = '';
   const source = token === '' ? 'entered' : 'env';
@@ -1122,6 +1163,7 @@ export async function login(flags, view = null) {
     else {
       checkSessionIsolation(store, environment, endpoint, token);
       const check = async () => {
+        if (environment !== 'main') await requireMainDev();
         const problem = await reachable(endpoint);
         if (problem !== null) throw new CliError(problem);
         done('Gateway', endpoint);
@@ -1696,9 +1738,9 @@ async function rotateToken(session, flags, commit = () => {}) {
 }
 
 // ── update ──────────────────────────────────────────────────────────────────
-// Official publications follow the selected environment; explicit mirrors and
-// local fixtures keep their recorded publisher. Gateway endpoints never supply
-// code. Every redirect hop is validated before it is requested, at most five.
+// Updates stay on the installed CLI's recorded publisher, independent of the
+// selected gateway. Gateway endpoints never supply code. Every redirect hop
+// is validated before it is requested, at most five.
 // The script runs with curl | bash's stdin, its output relayed through the
 // redactor, and does not relaunch the dashboard.
 const trustedUrl = url => typeof url === 'string' && (url.startsWith('https://') || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(\/|$)/.test(url));
@@ -1748,7 +1790,9 @@ async function update() {
 // ── dashboard ───────────────────────────────────────────────────────────────
 async function refreshIdentity(session, view) {
   try {
-    const identity = validateMe(await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me')));
+    const value = await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me'));
+    view.mainDev = session.environment === 'main' && isMainDev(value);
+    const identity = validateMe(value);
     if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email || identity.identityClass !== session.identityClass) {
       const next = { ...session, ...identity };
       saveSession(next);
@@ -1756,6 +1800,7 @@ async function refreshIdentity(session, view) {
     }
     return session;
   } catch (error) {
+    view.mainDev = false;
     if (error instanceof HttpError && error.status === 401) {
       return null;
     }
@@ -1768,6 +1813,7 @@ async function dashboard(flags) {
   if (!interactive()) throw usage('no terminal; run a command instead (genesis --help)');
   let environment = environmentId(flags.environment ?? loadStore().environment);
   let session = loadSession(environment);
+  let mainDev = false;
   const stack = [{ route: 'dashboard', title: 'genesis', selected: 0 }];
   const pendingClosures = new Set();
   const navigation = new AbortController();
@@ -1792,16 +1838,32 @@ async function dashboard(flags) {
     { value: 'configure', label: 'Configure' }, { value: 'model', label: 'Model' },
     { value: 'enable', label: 'Enable' }, { value: 'disable', label: 'Disable' }, { value: 'unset', label: 'Unset' },
   ];
+  const authorizeSecondary = async view => {
+    try { await requireMainDev(view); mainDev = true; } catch (error) {
+      mainDev = false;
+      if (environment !== 'main') session = null;
+      throw error;
+    }
+  };
   if (ansi()) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
   try {
+    if (environment !== 'main') {
+      try { await authorizeSecondary(stack[0]); } catch (error) {
+        if (error instanceof Interrupt) throw error;
+        push('result', 'Main access');
+        showResult(stack.at(-1), `Failed ${glyph.dot} Main access`, error.message, true);
+      }
+    }
     if (session !== null) {
       const initial = stack[0];
       const endpoint = session.endpoint;
       session = await refreshIdentity(session, initial);
-      if (session === null) push('login', 'Log in', {
-        endpoint, status: `Failed ${glyph.dot} Check saved login`, failed: true,
-        notice: `${hostOf(endpoint)} no longer accepts the stored key; log in again`,
-      });
+      if (environment === 'main') mainDev = initial.mainDev;
+      if (session === null) {
+        push('result', 'Saved login', { endpoint });
+        showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`,
+          `${hostOf(endpoint)} no longer accepts the stored key; log in again`, true);
+      }
       else if (initial.notice) {
         push('result', 'Connection error');
         showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`, initial.notice, true);
@@ -1811,18 +1873,25 @@ async function dashboard(flags) {
     while (stack.length > 0) {
       const view = stack.at(-1);
       view.identity = session === null
-        ? `${environmentLabel(environment)} ${glyph.dot} ${view.endpoint ?? ENVIRONMENTS[environment].endpoint} ${glyph.dot} not logged in`
+        ? `${environmentLabel(environment)} ${glyph.dot} ${view.endpoint ?? loadSession(environment)?.endpoint ?? ENVIRONMENTS[environment].endpoint ?? 'not configured'} ${glyph.dot} not logged in`
         : sessionIdentity(session);
       if (navigation.signal.aborted) throw new Interrupt();
       try {
         if (view.route === 'login') {
           renderScreen({ ...view, body: '', options: [] });
           session = await login({ environment }, view);
+          if (environment === 'main') {
+            try { await requireMainDev(view); mainDev = true; } catch (error) {
+              if (error instanceof Interrupt) throw error;
+              mainDev = false;
+            }
+          }
           delete view.notice;
           showResult(view, `Complete ${glyph.dot} Log in`);
           continue;
         }
         if (view.route === 'add') {
+          if (environment !== 'main') await authorizeSecondary(view);
           const { cleanup } = await addConnection(session, {}, view);
           const parent = stack.at(-2);
           const closing = cleanup.then(error => {
@@ -1837,18 +1906,28 @@ async function dashboard(flags) {
         }
         if (!view.ready) {
           const prepare = async () => {
+            if (environment !== 'main' && ['model', 'usage', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary();
             if (view.route === 'dashboard') {
+              if (environment === 'main' && session !== null) {
+                try { await requireMainDev(); mainDev = true; } catch (error) {
+                  if (error instanceof Interrupt) throw error;
+                  mainDev = false;
+                }
+              }
               view.body = session === null ? '' : renderStatus(await statusRows(session));
               view.options = [
-                { value: 'environment', label: 'Environment', hint: environmentLabel(environment) },
-                ...(session === null ? [{ value: 'login', label: 'Log in' }] : [
-                  { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
+                ...(mainDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
+                ...(environment !== 'main' && !mainDev ? [{ value: 'main', label: 'Main' }] : session === null ? [{ value: 'login', label: 'Log in' }] : []),
+                { value: 'clients', label: 'Clients' },
+                ...(session === null ? [] : [
+                  { value: 'usage', label: 'Usage' },
                   ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
                   ...(session.role === 'owner' ? [{ value: 'rotate', label: 'Rotate my key' }] : []),
                 ]),
                 { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
               ];
             } else if (view.route === 'environment') {
+              await authorizeSecondary(view);
               view.options = [...Object.entries(ENVIRONMENTS).map(([value, entry]) => ({
                 value, label: entry.label, hint: value === environment ? 'current' : undefined,
               })), backOption];
@@ -1858,7 +1937,7 @@ async function dashboard(flags) {
                 hint: `${row.status}${row.state?.model ? ` ${glyph.dot} ${row.state.model}` : ''}`,
               })), backOption];
             } else if (view.route === 'actions') {
-              view.options = [...actions, backOption];
+              view.options = [...(session === null ? actions.filter(action => action.value === 'disable') : actions), backOption];
               const row = (await statusRows(session, view.row.profile || undefined)).find(entry => entry.client.id === view.row.client.id && entry.profile === view.row.profile);
               if (row !== undefined) view.row = row;
               view.body = renderStatus([view.row]);
@@ -1891,11 +1970,20 @@ async function dashboard(flags) {
         if (choice === BACK) { pop(); continue; }
         if (view.route === 'dashboard') {
           const label = view.options.find(option => option.value === choice).label;
+          if (choice === 'main') {
+            session = await selectEnvironment('main');
+            environment = 'main';
+            view.ready = false;
+            if (session !== null) {
+              session = await refreshIdentity(session, view);
+              mainDev = view.mainDev;
+            }
+            continue;
+          }
           if (choice === 'rotate' || choice === 'update') push('confirm', label, { action: choice, actionLabel: label });
           else push(choice, label);
         } else if (view.route === 'environment') {
-          const next = loadSession(choice);
-          selectEnvironment(choice);
+          const next = await selectEnvironment(choice, view);
           environment = choice;
           session = next;
           view.identity = session === null ? `${environmentLabel(environment)} ${glyph.dot} not logged in` : sessionIdentity(session);
@@ -1914,10 +2002,12 @@ async function dashboard(flags) {
         } else if (view.route === 'confirm') {
           view.body = '';
           await runProgress(view, `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}`, async () => {
+            if (environment !== 'main' && !['update', 'disable'].includes(view.action)) await authorizeSecondary();
             if (view.action === 'rotate') await Promise.all(pendingClosures);
             const flags = { profile: view.row?.profile || undefined, model: view.model, overwrite: true };
             if (view.action === 'configure') await configure(session, view.row.client, flags);
-            else if (['enable', 'disable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
+            else if (view.action === 'disable') await switchScope(null, view.row.client, 'disable', flags);
+            else if (['enable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
             else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
             else if (view.action === 'update') await update();
           });
@@ -1954,7 +2044,8 @@ const HELP = `Usage: genesis [command] [options]
   logout
   status [--profile P]
   configure <client> [--model ID] [--profile P] [--overwrite]
-  enable | disable | unset <client> [--profile P]
+  disable <client> [--profile P]            local; no login required
+  enable | unset <client> [--profile P]
   model <client> [ID] [--profile P]         list or pick the client's default model
   usage [--json]                            your recorded usage
   capacity                                  owner/admin
@@ -2000,39 +2091,41 @@ async function main(argv) {
   switch (command) {
     case undefined: await dashboard(flags); return;
     case 'environment': {
-      const apply = () => {
+      const apply = async view => {
         if (rest.length > 1) throw usage('environment takes main or staging');
         if (rest.length === 1) {
           if (flags.environment !== undefined) throw usage('use environment main|staging without --environment to save the selection');
-          selectEnvironment(rest[0]);
+          await selectEnvironment(rest[0], view);
         }
         const store = loadStore();
         const environment = flags.environment ?? store.environment;
-        out(`${environmentLabel(environment)} ${glyph.dot} ${store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint}`);
+        if (rest.length === 0 && environment !== 'main') await requireMainDev(view);
+        out(`${environmentLabel(environment)} ${glyph.dot} ${store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint ?? 'not configured'}`);
       };
-      if (rest.length === 0) apply();
-      else await runAction('Environment', apply);
+      if (rest.length === 0) await apply(null);
+      else await runAction('Environment', apply, true);
       return;
     }
     case 'login': expect(0); await runAction('Log in', view => login(flags, view), true); return;
     case 'logout': expect(0); await runAction('Log out', () => logout(flags)); return;
-    case 'status': expect(0); await status(requireSession(flags), flags); return;
-    case 'configure': expect(1); await configure(requireSession(flags), clientById(rest[0]), flags); return;
-    case 'enable': case 'disable': case 'unset': expect(1); await switchScope(requireSession(flags), clientById(rest[0]), command, flags); return;
+    case 'status': expect(0); await status(await requireSession(flags), flags); return;
+    case 'configure': expect(1); await configure(await requireSession(flags), clientById(rest[0]), flags); return;
+    case 'disable': expect(1); await switchScope(null, clientById(rest[0]), command, flags); return;
+    case 'enable': case 'unset': expect(1); await switchScope(await requireSession(flags), clientById(rest[0]), command, flags); return;
     case 'model':
       if (rest.length < 1 || rest.length > 2) throw usage('model takes a client and an optional model id; see genesis --help');
-      await model(requireSession(flags), clientById(rest[0]), rest[1], flags);
+      await model(await requireSession(flags), clientById(rest[0]), rest[1], flags);
       return;
-    case 'usage': expect(0); await showUsage(requireSession(flags), flags); return;
-    case 'capacity': expect(0); await showCapacity(requireSession(flags)); return;
+    case 'usage': expect(0); await showUsage(await requireSession(flags), flags); return;
+    case 'capacity': expect(0); await showCapacity(await requireSession(flags)); return;
     case 'connections':
-      if (rest.length === 0 || (rest.length === 1 && rest[0] === 'list')) await showConnections(requireSession(flags));
-      else if (rest[0] === 'add' && rest.length === 1) await addConnection(requireSession(flags), flags);
+      if (rest.length === 0 || (rest.length === 1 && rest[0] === 'list')) await showConnections(await requireSession(flags));
+      else if (rest[0] === 'add' && rest.length === 1) await addConnection(await requireSession(flags), flags);
       else throw usage('connections takes list or add; see genesis --help');
       return;
     case 'token':
       if (rest.length !== 1 || rest[0] !== 'rotate') throw usage('token takes rotate; see genesis --help');
-      await rotateToken(requireSession(flags), flags);
+      await rotateToken(await requireSession(flags), flags);
       return;
     default: throw usage(`unknown command ${command}; see genesis --help`);
   }
