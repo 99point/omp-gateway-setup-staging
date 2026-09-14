@@ -23,6 +23,7 @@ const KEY = /^s99dev\.[A-Za-z0-9_-]{20,512}$/;
 const KEY_SHAPE = 'those start with s99dev. followed by 20-512 letters, digits, _ or -';
 const ROLES = new Set(['owner', 'admin', 'viewer', 'client']);
 const IDENTITY_CLASSES = new Set(['internal', 'external']);
+const identityClassOf = value => value === undefined ? 'internal' : IDENTITY_CLASSES.has(value) ? value : null;
 const HTTP_TIMEOUT_MS = 30_000;
 const LINK_POLL_MS = 2_000;
 const LOCAL_BODY_CAP = 16 * 1024;
@@ -205,14 +206,14 @@ function writeSessionText(text) {
 function storedSession(value, environment) {
   const file = sessionFile();
   if (!record(value) || typeof value.endpoint !== 'string' || typeof value.name !== 'string'
-    || !ROLES.has(value.role) || (value.identityClass !== undefined && !IDENTITY_CLASSES.has(value.identityClass))
+    || !ROLES.has(value.role)
     || (value.email !== null && typeof value.email !== 'string') || typeof value.updatedAt !== 'string') {
     throw new CliError(`${file} is not a genesis session store; remove it and run genesis login`);
   }
   if (!acceptKey(value.token)) throw new CliError(`${file} does not hold a personal gateway key; run genesis login`);
   return {
     endpoint: environmentEndpoint(value.endpoint, environment), name: value.name, role: value.role,
-    email: value.email, token: value.token, updatedAt: value.updatedAt, identityClass: value.identityClass ?? 'internal',
+    email: value.email, token: value.token, updatedAt: value.updatedAt, identityClass: identityClassOf(value.identityClass),
   };
 }
 function checkSessionIsolation(store, environment, endpoint, token) {
@@ -884,7 +885,7 @@ export function renderStatus(rows) {
     row.label, row.installed ? 'yes' : 'no', row.status, row.state?.model ?? '—', row.state?.gateway ? hostOf(row.state.gateway) : '—',
   ]));
 }
-const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}${session.identityClass === 'external' ? ` ${glyph.dot} external` : ''}`;
+const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}${session.identityClass === 'external' ? ` ${glyph.dot} external` : session.identityClass === null ? ` ${glyph.dot} unclassified` : ''}`;
 const header = session => out(paint('1', sessionIdentity(session)));
 
 // ── installer ───────────────────────────────────────────────────────────────
@@ -1084,10 +1085,10 @@ function keyRefusal(endpoint, source, status) {
 }
 function validateMe(value) {
   if (!record(value) || typeof value.name !== 'string' || value.name === '' || !ROLES.has(value.role)
-    || (value.identityClass !== undefined && !IDENTITY_CLASSES.has(value.identityClass)) || (value.email !== null && typeof value.email !== 'string')) {
+    || (value.email !== null && typeof value.email !== 'string')) {
     throw new CliError('the gateway answered /admin/api/cli/me with an unexpected shape');
   }
-  return { name: value.name, role: value.role, email: value.email, identityClass: value.identityClass ?? 'internal' };
+  return { name: value.name, role: value.role, email: value.email, identityClass: identityClassOf(value.identityClass) };
 }
 async function reachable(endpoint) {
   try {
