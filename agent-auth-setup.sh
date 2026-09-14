@@ -283,8 +283,12 @@ parse_options() {
     case "${harness}" in omp|codex) ;; *) fail '--profile is only supported by OMP and Codex; use the selected client config-directory environment for other scopes';; esac
   fi
   if [[ -n "${requested_model}" ]]; then
-    # Byte range 0x21-0x7e; the C locale keeps the bracket range a code-point range.
-    (export LC_ALL=C; [[ "${requested_model}" =~ ^[!-~]{1,256}$ ]]) || fail 'model ids are 1-256 printable ASCII characters without spaces'
+    # Byte range 0x21-0x7e; the C locale keeps the bracket range a code-point
+    # range. The length is checked apart from the regex: a {1,256} interval is
+    # above POSIX RE_DUP_MAX (255) on macOS/BSD regcomp, where [[ =~ ]] then
+    # fails to compile and would refuse every model id.
+    (( ${#requested_model} <= 256 )) && (export LC_ALL=C; [[ "${requested_model}" =~ ^[!-~]+$ ]]) \
+      || fail 'model ids are 1-256 printable ASCII characters without spaces'
     [[ "${action}" == configure ]] || fail '--model applies to configure only'
   fi
 }
