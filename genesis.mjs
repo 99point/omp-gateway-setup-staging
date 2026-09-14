@@ -404,7 +404,9 @@ const api = (session, method, pathname, body, timeoutMs) => request(session.endp
 
 // ── terminal ────────────────────────────────────────────────────────────────
 const utf8 = /utf-?8/i.test(process.env.LC_ALL || process.env.LC_CTYPE || process.env.LANG || '');
-const glyph = utf8 ? { ok: '✓', pick: '❯', step: '›', dot: '·' } : { ok: '+', pick: '>', step: '>', dot: '.' };
+const glyph = utf8
+  ? { ok: '✓', pick: '❯', step: '›', dot: '·', more: '…', range: '–' }
+  : { ok: '+', pick: '>', step: '>', dot: '.', more: '...', range: '-' };
 const ansi = () => process.env.TERM !== 'dumb';
 let screenOutput = null;
 let activeWork = null;
@@ -506,7 +508,14 @@ async function readLine(hidden) {
     }
   }
 }
-const columns = () => tty()?.output.columns || 80;
+// Node refreshes stdout's size on SIGWINCH; the /dev/tty stream is never
+// refreshed, so every frame measures the terminal stdout is on (interactive
+// use requires stdout to be a terminal).
+const windowSize = () => {
+  const source = process.stdout.isTTY === true ? process.stdout : tty()?.output;
+  return { columns: source?.columns || 80, rows: source?.rows || 24 };
+};
+const columns = () => windowSize().columns;
 const summary = (label, value) => term(`${tint('32', glyph.ok)} ${label.padEnd(9)} ${value}\n`);
 // ask(label, validate): validate returns {value} or {error}; the typed line is
 // replaced by a one-line summary once accepted, or by the error when refused
@@ -550,16 +559,16 @@ async function confirm(question, defaultYes = false) {
 }
 const BACK = Symbol('back');
 const backOption = { value: BACK, label: 'Back' };
+// Clipping and wrapping measure visible width: a painted line that fits
+// keeps its paint, one that does not is cut as plain text.
+const ANSI_PAINT = /\x1b\[[0-9;]*m/g;
 const clipLine = (text, width) => {
   const value = String(text);
-  if (value.length <= width) return value;
-  if (width <= 1) return '…'.slice(0, width);
-  return `${value.slice(0, width - 1)}…`;
+  const plain = value.replace(ANSI_PAINT, '');
+  if (plain.length <= width) return value;
+  if (width <= glyph.more.length) return glyph.more.slice(0, width);
+  return `${plain.slice(0, width - glyph.more.length)}${glyph.more}`;
 };
-// Lines wrap by their visible width: a dimmed table header carries escape
-// codes that must not count, so a line that fits keeps its paint and a line
-// that does not is wrapped as plain text.
-const ANSI_PAINT = /\x1b\[[0-9;]*m/g;
 const wrapLines = (text, width) => String(text ?? '').split('\n').flatMap(line => {
   if (line === '') return [''];
   const plain = line.replace(ANSI_PAINT, '');
@@ -568,9 +577,19 @@ const wrapLines = (text, width) => String(text ?? '').split('\n').flatMap(line =
   for (let offset = 0; offset < plain.length; offset += width) wrapped.push(plain.slice(offset, offset + width));
   return wrapped;
 });
+const heading = text => tint('1', tint('2', text));
+// One frame: title, the step's status line, the Status body, the Menu and
+// the key footer. The menu takes the rows it needs first (a long menu
+// scrolls behind "N above"/"N more" markers); the body gets the rest and
+// scrolls with Page Up/Down. Below sixteen rows the blank separators go, so
+// a short pane spends every row on the menu and the body. Everything is
+// redacted before it is measured or cut, so a clipped value can never leave
+// the head of a key behind.
 function renderScreen(view) {
-  const width = Math.max(20, columns() - 4);
-  const height = Math.max(8, tty().output.rows || 24);
+  const size = windowSize();
+  const width = Math.max(20, size.columns - 4);
+  const height = Math.max(8, size.rows);
+  const gap = height < 16 ? [] : [''];
   const options = view.options ?? [];
   if (view.selectionOptions !== options) {
     view.selectionOptions = options;
@@ -579,79 +598,74 @@ function renderScreen(view) {
   const renderedBody = Array.isArray(view.statusRows) ? renderStatus(view.statusRows, Math.min(width, 80)) : view.body;
   const body = [view.identity, renderedBody, view.notice].filter(Boolean).join('\n\n');
   const bodyLines = wrapLines(redact(body), width);
-  const title = clipLine(redact(view.title), width);
-  const status = view.status ? clipLine(redact(view.status), width) : null;
-  const chrome = [`${tint('1', title)}`, ''];
-  if (status !== null) chrome.push(`${tint(view.failed ? '31' : view.status.startsWith('Complete') ? '32' : '36', status)}`, '');
-  chrome.push(`${tint('1', tint('2', 'Status'))}`);
-  const menuChrome = ['', `${tint('1', tint('2', 'Menu'))}`, ''];
-  const footerKeys = view.root
-    ? (utf8 ? '↑↓ navigate • ⏎ select • esc quit' : '+/- navigate • Enter select • esc quit')
-    : (utf8 ? '↑↓ navigate • ⏎ select • esc back' : '+/- navigate • Enter select • esc back');
-  const footer = `${tint('2', footerKeys)}`;
-  const staticRows = chrome.length + menuChrome.length + 2;
-  const roomForMenu = Math.max(1, height - staticRows);
-  const markerRows = options.length > roomForMenu ? Math.min(2, roomForMenu) : 0;
-  const visibleCount = Math.max(1, roomForMenu - markerRows);
-  const firstOption = options.length <= visibleCount
-    ? 0
-    : Math.max(0, Math.min(view.selected - visibleCount + 1, options.length - visibleCount));
+  const head = [tint('1', clipLine(redact(view.title), width)), ...gap];
+  if (view.status) {
+    head.push(tint(view.failed ? '31' : view.status.startsWith('Complete') ? '32' : '36', clipLine(redact(view.status), width)), ...gap);
+  }
+  const footer = tint('2', [
+    utf8 ? '↑↓ navigate' : 'up/down navigate', utf8 ? '⏎ select' : 'Enter select', view.root ? 'esc quit' : 'esc back',
+  ].join(utf8 ? ' • ' : ' . '));
+  // Rows that are neither options nor body: the head, the Menu heading and
+  // the footer with their gaps, and the cursor's row under the footer.
+  const fixedRows = head.length + gap.length + 1 + gap.length + 1 + 1;
+  const roomForMenu = Math.max(1, height - fixedRows);
+  // A scrolled menu keeps the cursor inside its window; the window gives up
+  // one row per marker it actually draws.
+  const windowStart = count => (options.length <= count ? 0 : Math.max(0, Math.min(view.selected - count + 1, options.length - count)));
+  let visibleCount = Math.max(1, roomForMenu - (options.length > roomForMenu ? 1 : 0));
+  let firstOption = windowStart(visibleCount);
+  if (firstOption > 0 && firstOption + visibleCount < options.length) {
+    visibleCount = Math.max(1, roomForMenu - 2);
+    firstOption = windowStart(visibleCount);
+  }
   const lastOption = Math.min(options.length, firstOption + visibleCount);
-  const labelWidth = options.reduce((longest, option) => Math.max(longest, String(option.label).length), 0);
+  const labels = options.map(option => redact(String(option.label)));
+  const labelWidth = labels.reduce((longest, label) => Math.max(longest, label.length), 0);
   const optionRows = [];
+  if (firstOption > 0) optionRows.push(tint('2', `${glyph.more} ${firstOption} above`));
   for (let index = firstOption; index < lastOption; index++) {
     const option = options[index];
     const cursor = index === view.selected ? glyph.pick : ' ';
     const number = String(index + 1).padStart(2, ' ');
-    const label = String(option.label).padEnd(labelWidth, ' ');
-    const hint = option.hint ? `  ${tint('2', String(option.hint))}` : '';
-    optionRows.push(`${cursor} ${number}  ${label}${hint}`);
+    const hint = option.hint ? `  ${tint('2', redact(String(option.hint)))}` : '';
+    optionRows.push(clipLine(`${cursor} ${number}  ${labels[index].padEnd(labelWidth, ' ')}${hint}`, width - 2));
   }
-  if (lastOption < options.length) optionRows.push(tint('2', `… ${options.length - lastOption} more`));
-  const menuRows = menuChrome.length + optionRows.length + 1;
-  let bodyRows = Math.max(0, height - chrome.length - menuRows - 2);
-  const bodyOverflow = bodyRows > 0 && bodyLines.length > bodyRows;
-  if (bodyOverflow) bodyRows = Math.max(0, bodyRows - 1);
+  if (lastOption < options.length) optionRows.push(tint('2', `${glyph.more} ${options.length - lastOption} more`));
+  let bodyRows = bodyLines.length === 0 ? 0 : Math.max(0, height - fixedRows - optionRows.length - 1);
+  const bodyOverflow = bodyRows > 1 && bodyLines.length > bodyRows;
+  if (bodyOverflow) bodyRows -= 1;
   const maxOffset = Math.max(0, bodyLines.length - bodyRows);
   view.offset = view.offset === Infinity
     ? maxOffset
     : Math.max(0, Math.min(view.offset ?? 0, maxOffset));
-  const bodyShown = bodyRows > 0 ? bodyLines.slice(view.offset, view.offset + bodyRows) : [];
-  const bodyFrame = bodyShown;
-  if (bodyOverflow) bodyFrame.push(tint('2', `${view.offset + 1}–${Math.min(bodyLines.length, view.offset + bodyRows)}/${bodyLines.length}`));
+  const bodyFrame = bodyRows > 0 ? bodyLines.slice(view.offset, view.offset + bodyRows) : [];
+  if (bodyOverflow) bodyFrame.push(tint('2', `${view.offset + 1}${glyph.range}${Math.min(bodyLines.length, view.offset + bodyRows)}/${bodyLines.length}`));
+  const lines = [...head];
+  // A Status heading with nothing under it is noise: a pane that gave every
+  // row to the menu shows the menu alone.
+  if (bodyFrame.length > 0) lines.push(heading('Status'), ...bodyFrame);
+  lines.push(...gap, heading('Menu'), ...optionRows, ...gap, footer);
   const margin = line => line === '' ? '' : `  ${line}`;
-  const frame = [ansi() ? '\x1b[H\x1b[2J' : '\f'];
-  frame.push(`${margin(chrome[0])}\n`);
-  frame.push('\n');
-  if (status !== null) frame.push(`${margin(chrome[2])}\n\n`);
-  // A Status heading with nothing under it is noise: a short pane that gave
-  // every row to the menu shows the menu alone.
-  if (bodyFrame.length > 0) frame.push(`${margin(chrome.at(-1))}\n${bodyFrame.map(margin).join('\n')}\n`);
-  frame.push(`${menuChrome[0]}\n${margin(menuChrome[1])}\n`);
-  for (const row of optionRows) frame.push(`${margin(clipLine(row, width - 2))}\n`);
-  frame.push(`\n${margin(footer)}\n`);
-  term(frame.join(''));
+  term(`${ansi() ? '\x1b[H\x1b[2J' : '\f'}${lines.map(margin).join('\n')}\n`);
 }
 // Rebuilt menus start at their first action. Movement within one options list
-// keeps its cursor; Escape never confirms a highlighted action.
+// keeps its cursor; Escape never confirms a highlighted action. A typed
+// number moves the cursor at once; when the menu reaches the number a second
+// digit would form, the first waits briefly for it (so "12" is item 12, not
+// item 1 then item 2).
 async function selectScreen(view, signal, renderInitial = true) {
-  const { input, output } = tty();
+  const { input } = tty();
   if (signal?.aborted) return BACK;
   let keypress, resize, abort, ended;
   let pendingTimer = null;
-  let pendingDigit = false;
+  let pendingDigits = null;
+  const settlePending = () => {
+    clearTimeout(pendingTimer);
+    pendingTimer = null;
+    pendingDigits = null;
+  };
   try {
     return await new Promise((resolve, reject) => {
-      const settlePending = () => {
-        if (pendingTimer !== null) clearTimeout(pendingTimer);
-        pendingTimer = null;
-        if (pendingDigit) {
-          pendingDigit = false;
-          view.selected = 0;
-          renderScreen(view);
-        }
-      };
-      const selectBack = () => { settlePending(); resolve(BACK); };
       keypress = (text, key) => {
         if (key?.ctrl && key.name === 'c') {
           if (view.interrupt) view.interrupt();
@@ -660,23 +674,22 @@ async function selectScreen(view, signal, renderInitial = true) {
         }
         if (view.options.length === 0) return;
         const count = view.options.length;
-        const digit = /^[01]$/.test(text ?? '') ? text : null;
-        if (pendingDigit) {
-          if (digit !== null) {
-            if (pendingTimer !== null) clearTimeout(pendingTimer);
-            pendingTimer = null;
-            pendingDigit = false;
-            const selected = Number(`1${digit}`) - 1;
-            if (selected < count) view.selected = selected;
-            else view.selected = 0;
-            renderScreen(view);
-            return;
-          }
+        if (/^[0-9]$/.test(text ?? '')) {
+          const number = Number(`${pendingDigits ?? ''}${text}`);
           settlePending();
+          if (number < 1 || number > count) return;
+          view.selected = number - 1;
+          if (number * 10 <= count) {
+            pendingDigits = String(number);
+            pendingTimer = setTimeout(settlePending, 700);
+          }
+          renderScreen(view);
+          return;
         }
+        settlePending();
         if (key?.name === 'escape' || key?.name === 'left' || key?.name === 'backspace'
           || text === '\x7f' || (key?.ctrl && key.name === 'd') || text === 'q' || text === 'Q') {
-          selectBack();
+          resolve(BACK);
           return;
         }
         if (key?.name === 'return' || key?.name === 'enter') {
@@ -689,15 +702,7 @@ async function selectScreen(view, signal, renderInitial = true) {
         else if (key?.name === 'end') view.selected = count - 1;
         else if (key?.name === 'pageup') view.offset = Math.max(0, (view.offset ?? 0) - 5);
         else if (key?.name === 'pagedown') view.offset = (view.offset ?? 0) + 5;
-        else if (text === '0') return;
-        else if (/^[1-9]$/.test(text ?? '') && Number(text) <= count) {
-          if (text === '1' && count >= 10) {
-            pendingDigit = true;
-            pendingTimer = setTimeout(() => { pendingTimer = null; settlePending(); }, 700);
-            return;
-          }
-          view.selected = Number(text) - 1;
-        } else return;
+        else return;
         renderScreen(view);
       };
       resize = () => renderScreen(view);
@@ -705,7 +710,7 @@ async function selectScreen(view, signal, renderInitial = true) {
       ended = () => resolve(BACK);
       input.on('keypress', keypress);
       input.once('end', ended);
-      output.on('resize', resize);
+      process.stdout.on('resize', resize);
       signal?.addEventListener('abort', abort, { once: true });
       input.setRawMode(true);
       terminal.raw = true;
@@ -714,10 +719,10 @@ async function selectScreen(view, signal, renderInitial = true) {
       if (renderInitial) renderScreen(view);
     });
   } finally {
-    if (pendingTimer !== null) clearTimeout(pendingTimer);
+    settlePending();
     input.off('keypress', keypress);
     input.off('end', ended);
-    output.off('resize', resize);
+    process.stdout.off('resize', resize);
     signal?.removeEventListener('abort', abort);
     restoreTerminal();
   }
@@ -1001,18 +1006,27 @@ async function statusRows(session, profile) {
   }
   return rows;
 }
+// The client table. Given a width, the columns are budgeted from their
+// measured content: the widest ones give way first (a long model id before
+// a client label), and no cell is cut before it is redacted.
 export function renderStatus(rows, maxWidth = Infinity) {
+  const titles = ['client', 'installed', 'state', 'model', 'gateway'];
   const values = rows.map(row => [
     row.label, row.installed ? 'yes' : 'no', row.status, row.state?.model ?? '—', row.state?.gateway ? hostOf(row.state.gateway) : '—',
-  ]);
+  ].map(cell => redact(cell)));
   if (Number.isFinite(maxWidth)) {
-    const fixed = Math.max(8, Math.floor((maxWidth - 12 - 9 - 15 - 8) / 2));
-    for (const row of values) {
-      row[3] = clipLine(row[3], fixed);
-      row[4] = clipLine(row[4], fixed);
+    const widths = titles.map((cell, column) => Math.max(cell.length, ...values.map(row => row[column].length)));
+    const gaps = 2 * (titles.length - 1);
+    let excess = widths.reduce((sum, width) => sum + width, 0) + gaps - maxWidth;
+    while (excess > 0) {
+      const widest = widths.indexOf(Math.max(...widths));
+      if (widths[widest] <= 4) break;
+      widths[widest] -= 1;
+      excess -= 1;
     }
+    for (const row of values) for (const [column, width] of widths.entries()) row[column] = clipLine(row[column], width);
   }
-  return table(['client', 'installed', 'state', 'model', 'gateway'], values);
+  return table(titles, values);
 }
 const sessionIdentity = session => `${environmentLabel(session.environment)} ${glyph.dot} ${session.endpoint} ${glyph.dot} ${session.name} ${glyph.dot} ${session.role}${session.identityClass === 'external' ? ` ${glyph.dot} external` : session.identityClass === null ? ` ${glyph.dot} unclassified` : ''}`;
 const header = session => out(paint('1', sessionIdentity(session)));
@@ -1033,12 +1047,21 @@ function openSetupLog(client, action) {
   const file = setupLogFile();
   const directory = path.dirname(file);
   let fd = null;
+  // The log is private or it is skipped: a regular file this user owns,
+  // mode 0600 (an existing looser mode is tightened), never a symlink, and
+  // never anything that could block the open or the writes (a FIFO).
   try {
     if (checkSessionDir(directory) === null) { fs.mkdirSync(directory, { recursive: true, mode: 0o700 }); fs.chmodSync(directory, 0o700); }
     refuseSymlink(file);
-    fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o600);
+    fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== process.getuid()) throw new CliError(`${file} is not a private regular file`);
+    if ((stat.mode & 0o777) !== 0o600) fs.fchmodSync(fd, 0o600);
     fs.writeSync(fd, `== ${new Date().toISOString()} ${client.label} ${action}\n`);
-  } catch { fd = null; }
+  } catch {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* Already closed. */ } }
+    fd = null;
+  }
   const lines = [];
   const capture = source => {
     let held = '';
@@ -1079,7 +1102,7 @@ function setupCause(lines, code, signal) {
 function setupNextStep(cause, client) {
   if (/^model ids are 1-256 printable ASCII characters/.test(cause)) return 'run genesis update, then retry';
   if (/^could not reach /.test(cause)) return 'check the gateway URL and your network, then retry';
-  if (/is not served by this gateway/.test(cause)) return `pick a served model: genesis model ${client.id}`;
+  if (/^model .* is not served by this gateway/.test(cause)) return `pick a served model: genesis model ${client.id}`;
   if (/^(Node\.js|Python|curl|env) .*is required|^Python jsonschema|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
   if (/^no OMP protocol works/.test(cause)) return 'update OMP, then retry';
   return null;
@@ -1119,7 +1142,7 @@ function clientVersion(client) {
     let settled = false;
     const finish = value => { if (!settled) { settled = true; resolve(value); } };
     try {
-      const child = execFile(client.binary, ['--version'], { timeout: 5000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+      const child = execFile(client.binary, ['--version'], { timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024 }, (error, stdout) => {
         const line = String(stdout ?? '').split('\n').find(entry => entry.trim() !== '');
         finish(error || !line ? null : redact(line.trim()).slice(0, 80));
       });
@@ -1128,6 +1151,16 @@ function clientVersion(client) {
   });
 }
 const profileArgs = profile => (profile ? ['--profile', profile] : []);
+// The command that starts the client in the scope just configured: the
+// profile for OMP and Codex, and the directory override when one is in
+// force (the installer wrote the config where that variable points).
+const SCOPE_VARIABLES = { 'claude-code': 'CLAUDE_CONFIG_DIR', codex: 'CODEX_HOME', opencode: 'OPENCODE_CONFIG', pi: 'PI_CODING_AGENT_DIR' };
+const shellWord = value => (/^[A-Za-z0-9_./=:@%+,-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`);
+function runCommand(client, profile) {
+  const variable = SCOPE_VARIABLES[client.id];
+  const scope = variable !== undefined && process.env[variable] ? `${variable}=${shellWord(process.env[variable])} ` : '';
+  return `${scope}${client.binary}${['omp', 'codex'].includes(client.id) && profile ? ` --profile ${shellWord(profile)}` : ''}`;
+}
 function checkProfile(client, profile) {
   if (profile === undefined) return;
   if (!PROFILE.test(profile)) throw usage('profile names are [a-z0-9][a-z0-9._-]{0,63}');
@@ -1173,7 +1206,7 @@ async function configure(session, client, flags, view = null) {
       warn(`Client configured; could not read its saved model: ${error.message}`);
     }
     done('Key', 'staged');
-    done('Run', client.binary);
+    done('Run', runCommand(client, flags.profile));
     return true;
   };
   const label = `Configure ${client.label}`;
@@ -1490,7 +1523,7 @@ async function setup(flags) {
 async function status(session, flags) {
   header(session);
   out('');
-  out(renderStatus(await statusRows(session, flags.profile)));
+  out(renderStatus(await statusRows(session, flags.profile), process.stdout.isTTY === true ? columns() : Infinity));
 }
 async function model(session, client, requested, flags) {
   checkProfile(client, flags.profile);
@@ -1532,7 +1565,6 @@ async function showConnections(session) {
 const SMOKE_PROMPT = 'Reply with exactly: pong';
 const SMOKE_ROUTES = { anthropic: '/anthropic/v1/messages', 'openai-codex': '/openai-codex/v1/responses' };
 const SMOKE_TERMINAL = { anthropic: 'message_stop', 'openai-codex': 'response.completed' };
-const smokeRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 function smokeSse(text) {
   return String(text).split(/\r?\n\r?\n/).flatMap(block => {
     let event = null;
@@ -1547,33 +1579,51 @@ function smokeSse(text) {
     return [{ event: event ?? value?.type ?? null, value }];
   });
 }
+// The provider's cheapest served model by list price; a card without a price
+// only wins when nothing priced is served, and the first such card wins.
 function smokeModel(catalog, provider) {
-  if (!smokeRecord(catalog) || !Array.isArray(catalog.data)) throw new CliError('the gateway model catalog is not in the expected shape');
-  const choices = catalog.data.filter(card => smokeRecord(card) && card.owned_by === provider && typeof card.id === 'string'
-    && MODEL_ID.test(typeof card.request_model_id === 'string' ? card.request_model_id : rawModelId(card.id)));
-  choices.sort((left, right) => {
-    const price = card => smokeRecord(card.cost) && Number.isFinite(card.cost.input) && Number.isFinite(card.cost.output)
-      ? card.cost.input + card.cost.output : Infinity;
-    return price(left) - price(right);
-  });
-  if (choices.length === 0) return null;
-  const card = choices[0];
-  return typeof card.request_model_id === 'string' ? card.request_model_id : rawModelId(card.id);
+  let pick = null;
+  let pickPrice = Infinity;
+  for (const card of catalog.data) {
+    if (!record(card) || card.owned_by !== provider || typeof card.id !== 'string') continue;
+    const id = typeof card.request_model_id === 'string' ? card.request_model_id : rawModelId(card.id);
+    if (!MODEL_ID.test(id)) continue;
+    const price = record(card.cost) && Number.isFinite(card.cost.input) && Number.isFinite(card.cost.output) ? card.cost.input + card.cost.output : Infinity;
+    if (pick === null || price < pickPrice) { pick = id; pickPrice = price; }
+  }
+  return pick;
 }
+// /healthz: `admission` is the gate's own record ({accepting, mode, holdId…}
+// on the authority, plus `mode` on a serving replica); its absence is
+// reported as unknown, never as accepting.
 function smokeHealth(value) {
-  if (!smokeRecord(value) || value.ok !== true) throw new CliError('gateway is not ready');
-  const ready = value.ready === false ? 'not ready' : 'ready';
-  const workers = Number.isFinite(value.workers) ? value.workers : Number.isFinite(value.workerCount) ? value.workerCount : '—';
-  const admission = value.admission === 'held' ? 'held' : 'accepting';
+  if (!record(value) || value.ok !== true) throw new CliError('gateway is not ready');
+  const ready = value.ready === false ? `not ready${typeof value.reason === 'string' ? ` (${value.reason})` : ''}` : 'ready';
+  const workers = Number.isFinite(value.workers) ? value.workers : '—';
+  const admission = !record(value.admission) ? 'unknown'
+    : typeof value.admission.mode === 'string' ? value.admission.mode
+      : value.admission.accepting === true ? 'accepting' : value.admission.accepting === false ? 'holding' : 'unknown';
   return `ok ${glyph.dot} ${ready} ${glyph.dot} workers ${workers} ${glyph.dot} admission ${admission}`;
 }
 function smokeModels(catalog) {
-  if (!smokeRecord(catalog) || !Array.isArray(catalog.data)) throw new CliError('the gateway model catalog is not in the expected shape');
-  const counts = Object.fromEntries(Object.keys(SMOKE_ROUTES).map(provider => [provider, 0]));
-  for (const card of catalog.data) if (smokeRecord(card) && Object.hasOwn(counts, card.owned_by)) counts[card.owned_by] += 1;
-  const served = catalog.data.filter(card => smokeRecord(card) && typeof card.id === 'string');
-  return { detail: `${served.length} served ${glyph.dot} anthropic ${counts.anthropic} ${glyph.dot} openai-codex ${counts['openai-codex']}`, counts };
+  if (!record(catalog) || !Array.isArray(catalog.data)) throw new CliError('the gateway model catalog is not in the expected shape');
+  const served = catalog.data.filter(card => record(card) && typeof card.id === 'string');
+  if (served.length === 0) throw new CliError('no models are served');
+  const count = provider => served.filter(card => card.owned_by === provider).length;
+  return `${served.length} served ${glyph.dot} anthropic ${count('anthropic')} ${glyph.dot} openai-codex ${count('openai-codex')}`;
 }
+// A refusal's reason, in either JSON form the doors send ({error: "…"} or
+// {error: {message}}) or a stream's error/response.failed payload; redacted
+// before it is shortened, so a cut can never leave the head of a key behind.
+const smokeReason = (...values) => {
+  for (const value of values) {
+    const text = typeof value?.error === 'string' ? value.error
+      : typeof value?.error?.message === 'string' ? value.error.message
+        : typeof value?.message === 'string' ? value.message : null;
+    if (text !== null) return redact(text).replace(/\s+/g, ' ').trim().slice(0, 200);
+  }
+  return null;
+};
 async function smokeCall(session, provider, model) {
   const endpoint = session.endpoint;
   const headers = { Accept: 'text/event-stream', Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' };
@@ -1591,11 +1641,12 @@ async function smokeCall(session, provider, model) {
     } catch (error) {
       throw new CliError(`could not reach ${hostOf(endpoint)}: ${reasonOf(error)}`);
     }
-    // First text is the wall time of the first visible delta as the stream
-    // arrives, not the end of the body.
-    const isText = entry => (provider === 'anthropic'
-      ? entry.event === 'content_block_delta' && typeof entry.value?.delta?.text === 'string'
-      : entry.event === 'response.output_text.delta' && typeof entry.value?.delta === 'string');
+    // First text is the wall time of the first non-empty visible delta as the
+    // stream arrives, not the end of the body.
+    const textOf = entry => (provider === 'anthropic'
+      ? (entry.event === 'content_block_delta' ? entry.value?.delta?.text : undefined)
+      : (entry.event === 'response.output_text.delta' ? entry.value?.delta : undefined));
+    const isText = entry => typeof textOf(entry) === 'string' && textOf(entry) !== '';
     let text = '';
     let firstAt = null;
     if (response.body !== null) {
@@ -1609,12 +1660,14 @@ async function smokeCall(session, provider, model) {
     const events = smokeSse(text);
     let errorBody = null;
     try { errorBody = JSON.parse(text || '{}'); } catch { errorBody = null; }
-    if (!response.ok) throw new CliError(`HTTP ${response.status}: ${smokeRecord(errorBody) && typeof errorBody.error === 'string' ? errorBody.error : 'request failed'}`);
+    const failure = events.find(entry => entry.event === 'error' || entry.event === 'response.failed')?.value;
+    const reason = smokeReason(errorBody, failure, failure?.response);
+    if (!response.ok) throw new CliError(`HTTP ${response.status}: ${reason ?? 'request failed'}`);
     const terminalEvent = events.at(-1)?.event;
-    if (terminalEvent !== SMOKE_TERMINAL[provider]) throw new CliError(`stream ended with ${terminalEvent ?? 'no event'}, not ${SMOKE_TERMINAL[provider]}`);
-    const reply = provider === 'anthropic'
-      ? events.filter(entry => entry.event === 'content_block_delta').map(entry => entry.value?.delta?.text ?? '').join('')
-      : events.filter(entry => entry.event === 'response.output_text.delta').map(entry => entry.value?.delta ?? '').join('');
+    if (terminalEvent !== SMOKE_TERMINAL[provider]) {
+      throw new CliError(`stream ended with ${terminalEvent ?? 'no event'}, not ${SMOKE_TERMINAL[provider]}${reason === null ? '' : `: ${reason}`}`);
+    }
+    const reply = events.map(entry => (typeof textOf(entry) === 'string' ? textOf(entry) : '')).join('');
     const lastValue = events.at(-1)?.value;
     const usage = provider === 'anthropic'
       ? {
@@ -1630,13 +1683,16 @@ async function smokeCall(session, provider, model) {
     const first = firstAt === null ? null : firstAt - started;
     return {
       status: response.status,
-      first, total, terminal: terminalEvent, reply: reply.trim().slice(0, 60),
+      first, total, terminal: terminalEvent, reply: redact(reply).trim().slice(0, 60),
       input: usage.input, output: usage.output,
     };
   } finally { deadline.close(); }
 }
 const smokeSeconds = value => value === null ? '—' : `${(value / 1000).toFixed(1)}s`;
 const smokeTokens = value => Number.isFinite(value) ? String(value) : '—';
+// Health, login, the catalog, then one real streamed call per provider. A
+// provider the catalog does not serve is a failed check, never a missing
+// one: an all-green smoke always made both calls.
 async function smoke(session, flags, view = null) {
   const execute = async () => {
     const checks = [];
@@ -1654,8 +1710,8 @@ async function smoke(session, flags, view = null) {
       }
       return checks.at(-1);
     };
-    const health = await add('health', () => request(session.endpoint, null, 'GET', '/healthz'), smokeHealth);
-    const login = await add('login', () => api(session, 'GET', '/admin/api/cli/me'), value => {
+    await add('health', () => request(session.endpoint, null, 'GET', '/healthz'), smokeHealth);
+    await add('login', () => api(session, 'GET', '/admin/api/cli/me'), value => {
       const identity = validateMe(value);
       return `${identity.name} ${glyph.dot} ${identity.role} ${glyph.dot} ${identity.identityClass ?? 'unclassified'}`;
     });
@@ -1663,19 +1719,18 @@ async function smoke(session, flags, view = null) {
     const models = await add('models', async () => {
       catalog = await api(session, 'GET', '/v1/models');
       return smokeModels(catalog);
-    }, value => value.detail);
-    if (models.ok) {
-      for (const provider of Object.keys(SMOKE_ROUTES)) {
-        const model = smokeModel(catalog, provider);
-        if (model === null) continue;
-        await add(provider, () => smokeCall(session, provider, model), value =>
-          `${model} ${glyph.dot} HTTP ${value.status} ${glyph.dot} first text ${smokeSeconds(value.first)} ${glyph.dot} total ${smokeSeconds(value.total)} ${glyph.dot} terminal ${value.terminal} ${glyph.dot} "${value.reply}" ${glyph.dot} ${smokeTokens(value.input)}/${smokeTokens(value.output)} tokens`);
-      }
+    }, value => value);
+    for (const provider of Object.keys(SMOKE_ROUTES)) {
+      const model = models.ok ? smokeModel(catalog, provider) : null;
+      await add(provider, () => {
+        if (model === null) throw new CliError(models.ok ? 'no served model' : 'no model catalog');
+        return smokeCall(session, provider, model);
+      }, value =>
+        `${model} ${glyph.dot} HTTP ${value.status} ${glyph.dot} first text ${smokeSeconds(value.first)} ${glyph.dot} total ${smokeSeconds(value.total)} ${glyph.dot} terminal ${value.terminal} ${glyph.dot} "${value.reply}" ${glyph.dot} ${smokeTokens(value.input)}/${smokeTokens(value.output)} tokens`);
     }
     const passed = checks.filter(check => check.ok).length;
     if (!flags.json) out(`${passed} of ${checks.length} checks passed`);
-    const report = { environment: session.environment, endpoint: session.endpoint, ok: passed === checks.length, checks };
-    return report;
+    return { environment: session.environment, endpoint: session.endpoint, ok: passed === checks.length, checks };
   };
   const report = view === null || flags.json ? await execute() : await runProgress(view, 'Smoke', execute);
   if (flags.json) out(JSON.stringify(report, null, 2));
@@ -1956,6 +2011,7 @@ async function addConnection(session, flags, view = null) {
   let closing = false;
   let localUrl = '';
   let cancellationError = null;
+  let connected = 0;
   const report = (text, failed = false) => {
     if (view === null) { (failed ? warn : note)(text); return; }
     if (closing) return;
@@ -1970,9 +2026,10 @@ async function addConnection(session, flags, view = null) {
     const changed = link === null || next.attemptId !== link.attemptId || next.status !== link.status;
     link = next;
     if (changed && link.status === 'done') {
-      const connected = `${PROVIDER_LABELS[link.provider] ?? link.provider} on ${link.workerId}`;
-      if (view === null) done('Connected', connected);
-      else report(`Connected ${glyph.dot} ${connected}`);
+      connected += 1;
+      const where = `${PROVIDER_LABELS[link.provider] ?? link.provider} on ${link.workerId}`;
+      if (view === null) done('Connected', where);
+      else report(`Connected ${glyph.dot} ${where}`);
     } else if (changed && link.status === 'failed') report(`connection failed${link.error ? `: ${link.error}` : ''}`, true);
     else if (changed) report(`${PROVIDER_LABELS[link.provider] ?? link.provider} ${glyph.dot} ${link.workerId} ${glyph.dot} ${link.status}`);
     if (LINK_TERMINAL.has(link.status) && closeCallback !== null) { closeCallback(); closeCallback = null; }
@@ -2115,7 +2172,7 @@ async function addConnection(session, flags, view = null) {
     process.off('SIGTERM', interrupt);
   }
   if (interrupted) throw new Interrupt();
-  return { cleanup: shutdownTask };
+  return { cleanup: shutdownTask, connected: () => connected };
 }
 
 // ── key rotation ────────────────────────────────────────────────────────────
@@ -2352,19 +2409,28 @@ async function dashboard(flags) {
         }
         if (view.route === 'add') {
           if (environment !== 'prod') await authorizeSecondary(view);
-          const { cleanup } = await addConnection(session, {}, view);
+          const { cleanup, connected } = await addConnection(session, {}, view);
           const parent = stack.at(-2);
+          // A link that settled as connected changed the inventory the parent
+          // shows, whether it settled before Back or while the launcher was
+          // closing behind it.
+          const invalidate = () => { for (const entry of stack) entry.ready = false; };
           const closing = cleanup.then(error => {
+            if (connected() > 0) invalidate();
             if (error !== null) {
               parent.notice = error;
               if (activeView === parent) renderScreen(parent);
             }
           }).finally(() => pendingClosures.delete(closing));
           pendingClosures.add(closing);
-          pop();
+          pop(connected() > 0);
           continue;
         }
         if (view.route === 'smoke') {
+          // Staging is only reached with live Prod developer access: the
+          // recheck happens here, before any request, like every other
+          // secondary-gateway read.
+          if (environment !== 'prod') await authorizeSecondary(view);
           view.body = '';
           await smoke(session, {}, view);
           showResult(view, `Complete ${glyph.dot} Smoke`);
@@ -2373,7 +2439,7 @@ async function dashboard(flags) {
         if (view.route === 'dashboard' && view.ready && view.stateKey !== stateKey()) view.ready = false;
         if (!view.ready) {
           const prepare = async () => {
-            if (environment !== 'prod' && ['model', 'usage', 'capacity', 'connections', 'smoke'].includes(view.route)) await authorizeSecondary();
+            if (environment !== 'prod' && ['model', 'usage', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary(view);
             if (view.route === 'dashboard') {
               // refreshIdentity() is the sole /me read for this dashboard.
               // In particular, do not turn a prepared main menu into a
@@ -2392,8 +2458,8 @@ async function dashboard(flags) {
                   { value: 'apply', label: 'Apply', hint: `configure installed clients for ${environmentLabel(environment)}` },
                   { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
                   ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
-                  { value: 'smoke', label: 'Smoke', hint: 'health · login · models · one real call per provider' },
-                  { value: 'key', label: 'Key', hint: 'rotate · change gateway URL or key' },
+                  { value: 'smoke', label: 'Smoke', hint: ['health', 'login', 'models', 'one real call per provider'].join(` ${glyph.dot} `) },
+                  { value: 'key', label: 'Key', hint: ['rotate', 'change gateway URL or key'].join(` ${glyph.dot} `) },
                   { value: 'logout', label: 'Log out' }, { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
                 ];
             } else if (view.route === 'environment') {
