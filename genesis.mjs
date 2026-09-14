@@ -36,8 +36,8 @@ const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
 const ENVIRONMENTS = Object.freeze({
-  main: { label: 'Main', endpoint: 'https://genesis.99point.co', installUrl: 'https://raw.githubusercontent.com/99point/omp-gateway-setup/main/install.sh' },
-  staging: { label: 'Staging', endpoint: 'https://genesis-staging.99point.co', installUrl: 'https://raw.githubusercontent.com/99point/omp-gateway-setup-staging/staging/install.sh' },
+  main: { label: 'Main', endpoint: 'https://genesis.99point.co' },
+  staging: { label: 'Staging', endpoint: 'https://genesis-staging.99point.co' },
 });
 function environmentId(value) {
   if (typeof value !== 'string' || !Object.hasOwn(ENVIRONMENTS, value)) throw usage('environment must be main or staging');
@@ -521,7 +521,10 @@ function renderScreen(view) {
   const width = Math.max(20, columns() - 1);
   const height = Math.max(8, tty().output.rows || 24);
   const options = view.options;
-  view.selected = Math.max(0, Math.min(view.selected ?? 0, options.length - 1));
+  if (view.selectionOptions !== options) {
+    view.selectionOptions = options;
+    view.selected = Math.max(0, options.findIndex(option => option.value !== BACK));
+  } else if (!options[view.selected]) view.selected = 0;
   const body = [view.identity, view.body, view.notice].filter(Boolean).join('\n\n');
   const lines = redact(body).split('\n').flatMap(line => {
     const wrapped = [];
@@ -552,8 +555,8 @@ function renderScreen(view) {
   });
   term(frame.join(''));
 }
-// One screen owns terminal input until it is left. The route keeps its cursor
-// and scroll position; Escape never confirms a highlighted action.
+// Rebuilt menus start at their first action. Movement within one options list
+// keeps its cursor; Escape never confirms a highlighted action.
 async function selectScreen(view, signal, renderInitial = true) {
   const { input, output } = tty();
   if (signal?.aborted) return BACK;
@@ -1168,7 +1171,6 @@ async function model(session, client, requested, flags) {
     if (view === null) { out(renderModels(models, current)); return true; }
     const choice = await selectScreen({
       ...view,
-      selected: Math.max(0, models.findIndex(entry => entry.id === current)),
       options: [...modelOptions(models, current), backOption],
     });
     if (choice === BACK) return false;
@@ -1700,7 +1702,6 @@ async function rotateToken(session, flags, commit = () => {}) {
 // The script runs with curl | bash's stdin, its output relayed through the
 // redactor, and does not relaunch the dashboard.
 const trustedUrl = url => typeof url === 'string' && (url.startsWith('https://') || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(\/|$)/.test(url));
-const publishedInstallUrl = /^https:\/\/raw\.githubusercontent\.com\/99point\/omp-gateway-setup(?:-staging)?\/[^/]+\/install\.sh$/;
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 async function fetchScript(url) {
   let current = url;
@@ -1725,14 +1726,12 @@ async function fetchScript(url) {
     } finally { deadline.close(); }
   }
 }
-async function update(flags) {
+async function update() {
   return runAction('Update', async () => {
     const release = releaseInfo();
     if (release === null) throw new CliError(`no release.json beside ${path.join(here, 'genesis.mjs')} (a source checkout is not updated in place); rerun the published install line`);
     if (!trustedUrl(release.installUrl)) throw new CliError(`${path.join(here, 'release.json')} records no https install URL; rerun the published install line`);
-    const installUrl = publishedInstallUrl.test(release.installUrl)
-      ? ENVIRONMENTS[flags.environment ?? loadStore().environment].installUrl
-      : release.installUrl;
+    const installUrl = release.installUrl;
     note(`downloading ${installUrl}`);
     const script = await fetchScript(installUrl);
     note(`installing from ${installUrl}`);
@@ -1850,7 +1849,6 @@ async function dashboard(flags) {
                 { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
               ];
             } else if (view.route === 'environment') {
-              if (view.options === undefined) view.selected = Object.keys(ENVIRONMENTS).indexOf(environment);
               view.options = [...Object.entries(ENVIRONMENTS).map(([value, entry]) => ({
                 value, label: entry.label, hint: value === environment ? 'current' : undefined,
               })), backOption];
@@ -1867,7 +1865,6 @@ async function dashboard(flags) {
             } else if (view.route === 'model') {
               const models = servedModels(await api(session, 'GET', '/v1/models'), view.row.client);
               const current = currentModelId(readState((await resolveScope(view.row.client, view.row.profile || undefined)).stateFile, view.row.client.id));
-              if (view.options === undefined) view.selected = Math.max(0, models.findIndex(entry => entry.id === current));
               view.options = [...modelOptions(models, current), backOption];
             } else if (view.route === 'usage') {
               view.body = renderUsage(await api(session, 'GET', '/admin/api/cli/usage'));
@@ -1894,7 +1891,7 @@ async function dashboard(flags) {
         if (choice === BACK) { pop(); continue; }
         if (view.route === 'dashboard') {
           const label = view.options.find(option => option.value === choice).label;
-          if (choice === 'rotate' || choice === 'update') push('confirm', label, { action: choice, actionLabel: label, selected: 1 });
+          if (choice === 'rotate' || choice === 'update') push('confirm', label, { action: choice, actionLabel: label });
           else push(choice, label);
         } else if (view.route === 'environment') {
           const next = loadSession(choice);
@@ -1909,9 +1906,9 @@ async function dashboard(flags) {
         } else if (view.route === 'actions') {
           const label = actions.find(action => action.value === choice).label;
           if (choice === 'model') push('model', label, { row: view.row });
-          else push('confirm', label, { row: view.row, action: choice, actionLabel: label, selected: 1 });
+          else push('confirm', label, { row: view.row, action: choice, actionLabel: label });
         } else if (view.route === 'model') {
-          push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice, selected: 1 });
+          push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice });
         } else if (view.route === 'connections') {
           push('add', 'Add connection');
         } else if (view.route === 'confirm') {
@@ -1922,7 +1919,7 @@ async function dashboard(flags) {
             if (view.action === 'configure') await configure(session, view.row.client, flags);
             else if (['enable', 'disable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
             else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
-            else if (view.action === 'update') await update({ environment });
+            else if (view.action === 'update') await update();
           });
           showResult(view, `Complete ${glyph.dot} ${view.actionLabel}`);
         }
@@ -1998,7 +1995,7 @@ async function main(argv) {
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
   if (flags.url !== undefined && command !== 'login') throw usage('--url is only accepted by login; it never retargets a stored key');
   if (flags.json && command !== 'usage') throw usage('--json is only accepted by usage');
-  if (flags.update || command === 'update') { await update(flags); return; }
+  if (flags.update || command === 'update') { await update(); return; }
   const expect = count => { if (rest.length !== count) throw usage(`${command} takes ${count === 0 ? 'no arguments' : `${count} argument${count === 1 ? '' : 's'}`}; see genesis --help`); };
   switch (command) {
     case undefined: await dashboard(flags); return;
