@@ -1923,7 +1923,7 @@ function paintDestination() {
   if (next === undefined || next.unavailable) { destination.className = 'bad'; destination.textContent = 'topology unavailable'; }
   else if (next.available) { destination.className = ''; destination.textContent = 'next: ' + (selected || next.workerId); }
   else if (['provisioning', 'admitting'].includes(provisioning?.state)) { destination.className = ''; destination.textContent = provisioning.state + ' · ' + provisioning.workerId; }
-  else { destination.className = 'bad'; destination.textContent = provisioning?.error || 'no slot'; }
+  else { destination.className = 'bad'; destination.textContent = provisioning?.error || 'no slot · spawn a worker from the console'; }
   $('#add').textContent = 'Add' + ($('#provider').value ? ' ' + (labels[$('#provider').value] || $('#provider').value) : '');
   $('#add').disabled = !next?.available || busy();
   paintLink();
