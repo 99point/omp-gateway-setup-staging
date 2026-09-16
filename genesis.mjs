@@ -296,6 +296,7 @@ function clearSession(environment) {
   }
   return selected;
 }
+const notLoggedIn = environment => new CliError(`${environmentLabel(environment)} is not logged in; run genesis login --environment ${environment}`);
 async function requireSession(flags) {
   const store = loadStore();
   const environment = environmentId(flags.environment ?? store.environment);
@@ -303,7 +304,7 @@ async function requireSession(flags) {
     await runAction('Prod access', async view => { await requireProdDev(view); return false; }, true);
   }
   const session = store.sessions[environment];
-  if (session === undefined) throw new CliError(`${environmentLabel(environment)} is not logged in; run genesis login --environment ${environment}`);
+  if (session === undefined) throw notLoggedIn(environment);
   return { environment, ...session };
 }
 
@@ -366,7 +367,7 @@ function requestDeadline(timeoutMs, interruptible = true) {
 // JSON in, JSON out. Failures become one line naming the host and the server's
 // `error`; a bearer is sent only when it is a personal key, and its bytes are
 // redacted from every rendered line.
-async function request(endpoint, token, method, pathname, body, timeoutMs = HTTP_TIMEOUT_MS) {
+async function request(endpoint, token, method, pathname, body, timeoutMs = HTTP_TIMEOUT_MS, interruptible = method === 'GET') {
   if (workContext.getStore()?.signal.aborted) throw new Interrupt();
   const headers = { Accept: 'application/json' };
   if (token !== null) {
@@ -374,9 +375,10 @@ async function request(endpoint, token, method, pathname, body, timeoutMs = HTTP
     headers.Authorization = `Bearer ${token}`;
   }
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  // A dispatched mutation must settle (notably key rotation) so its committed
-  // result can be saved. Read requests can stop immediately.
-  const deadline = requestDeadline(timeoutMs, method === 'GET');
+  // A dispatched mutation settles by default (notably key rotation) so its
+  // committed result can be saved. Account actions can opt into cancellation
+  // when their result does not contain a replacement credential.
+  const deadline = requestDeadline(timeoutMs, interruptible);
   try {
     let response;
     try {
@@ -394,13 +396,15 @@ async function request(endpoint, token, method, pathname, body, timeoutMs = HTTP
     let value = null;
     try { value = text === '' ? null : JSON.parse(text); } catch { value = null; }
     if (!response.ok) {
-      const detail = typeof value?.error === 'string' ? value.error : `unexpected ${response.status} response`;
+      const detail = typeof value?.error === 'string' ? value.error
+        : typeof value?.error?.message === 'string' ? value.error.message : `unexpected ${response.status} response`;
       throw new HttpError(response.status, `${hostOf(endpoint)}: ${detail} (HTTP ${response.status})`);
     }
     return value;
   } finally { deadline.close(); }
 }
-const api = (session, method, pathname, body, timeoutMs) => request(session.endpoint, session.token, method, pathname, body, timeoutMs);
+const api = (session, method, pathname, body, timeoutMs, interruptible) =>
+  request(session.endpoint, session.token, method, pathname, body, timeoutMs, interruptible);
 
 // ── terminal ────────────────────────────────────────────────────────────────
 const utf8 = /utf-?8/i.test(process.env.LC_ALL || process.env.LC_CTYPE || process.env.LANG || '');
@@ -477,26 +481,38 @@ function readChunk() {
   input.setRawMode(true);
   terminal.raw = true;
   input.resume();
-  return new Promise(resolve => {
-    input.once('data', chunk => {
-      input.pause();
-      input.setRawMode(false);
-      terminal.raw = false;
-      resolve(chunk.toString('utf8'));
-    });
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      input.off('data', data);
+      input.off('end', interrupt);
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(signal, interrupt);
+      restoreTerminal();
+    };
+    const data = chunk => { cleanup(); resolve(chunk.toString('utf8')); };
+    const interrupt = () => { cleanup(); reject(new Interrupt()); };
+    input.once('data', data);
+    input.once('end', interrupt);
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, interrupt);
   });
 }
+const PROMPT_CANCEL = Symbol('prompt cancel');
 // One line from the terminal in raw mode: no echo when hidden, backspace and
-// Ctrl-U edit, Ctrl-C interrupts, escape sequences (arrows) are ignored.
-async function readLine(hidden) {
+// Ctrl-U edit, Ctrl-C interrupts, and Escape cancels the prompt while longer
+// terminal escape sequences remain ignored.
+async function readLine(hidden, cancellable = false) {
   let line = '';
   for (;;) {
     const chunk = await readChunk();
+    if (chunk === '\x1b' && cancellable) return PROMPT_CANCEL;
     if (chunk.startsWith('\x1b')) continue;
     for (const char of chunk) {
       if (char === '\r' || char === '\n') { term('\n'); return line; }
       if (char === '\x03') { term('\n'); throw new Interrupt(); }
-      if (char === '\x04' && line === '') { term('\n'); throw new CliError('cancelled', 1); }
+      if (char === '\x04' && line === '') {
+        term('\n');
+        if (cancellable) return PROMPT_CANCEL;
+        throw new CliError('cancelled', 1);
+      }
       if (char === '\x7f' || char === '\b') {
         if (line !== '') { line = line.slice(0, -1); if (!hidden) term('\b \b'); }
         continue;
@@ -521,12 +537,13 @@ const summary = (label, value) => term(`${tint('32', glyph.ok)} ${label.padEnd(9
 // replaced by a one-line summary once accepted, or by the error when refused
 // (so a key pasted here stays on screen no longer than the prompt). An empty
 // line takes `fallback` when one is shown.
-async function ask(label, validate, summaryLabel = label, fallback = null) {
+async function ask(label, validate, summaryLabel = label, fallback = null, cancellable = false) {
   for (;;) {
     const hint = fallback === null ? '' : ` (${fallback})`;
     const prompt = `? ${label}${hint} ${glyph.step} `;
     term(`${tint('36', '?')} ${tint('1', label)}${tint('2', hint)} ${glyph.step} `);
-    const line = await readLine(false);
+    const line = await readLine(false, cancellable);
+    if (line === PROMPT_CANCEL) return PROMPT_CANCEL;
     const result = validate(line.trim() === '' && fallback !== null ? fallback : line);
     if (ansi()) term(`\x1b[${Math.floor((prompt.length + line.length) / columns()) + 1}A\x1b[J`);
     if (result.error === undefined) {
@@ -558,6 +575,8 @@ async function confirm(question, defaultYes = false) {
   }
 }
 const BACK = Symbol('back');
+// The account panel's active tab changed (view.tab already names the new one).
+const SWITCH = Symbol('switch');
 const backOption = { value: BACK, label: 'Back' };
 // Clipping and wrapping measure visible width: a painted line that fits
 // keeps its paint, one that does not is cut as plain text.
@@ -578,36 +597,70 @@ const wrapLines = (text, width) => String(text ?? '').split('\n').flatMap(line =
   return wrapped;
 });
 const heading = text => tint('1', tint('2', text));
-// One frame: title, the step's status line, the Status body, the Menu and
-// the key footer. The menu takes the rows it needs first (a long menu
-// scrolls behind "N above"/"N more" markers); the body gets the rest and
-// scrolls with Page Up/Down. Below sixteen rows the blank separators go, so
-// a short pane spends every row on the menu and the body. Everything is
-// redacted before it is measured or cut, so a clipped value can never leave
-// the head of a key behind.
+// The key footer: the keys a frame answers to, on as many lines as the width
+// needs. A menu navigates and selects; the account panel flips tabs, scrolls
+// a tab without actions row by row, and names its hotkeys.
+function footerLines(view, width) {
+  if (view.prompt) return [tint('2', `${utf8 ? '⏎ submit' : 'Enter submit'} ${glyph.dot} esc back`)];
+  if (view.interrupt) return [tint('2', 'ctrl-c stop')];
+  const keys = view.tabs === undefined
+    ? [utf8 ? '↑↓ navigate' : 'up/down navigate', utf8 ? '⏎ select' : 'Enter select']
+    : [
+      utf8 ? '←→ tabs' : 'left/right tabs',
+      ...((view.options ?? []).length > 0
+        ? [utf8 ? '↑↓ navigate' : 'up/down navigate', utf8 ? '⏎ select' : 'Enter select']
+        : [utf8 ? '↑↓ scroll' : 'up/down scroll']),
+      ...Object.entries(view.keys ?? {}).map(([key, label]) => `${key} ${label}`),
+    ];
+  keys.push(view.root ? 'esc quit' : 'esc back');
+  const separator = utf8 ? ' • ' : ' . ';
+  const lines = [];
+  for (const key of keys) {
+    const last = lines.length - 1;
+    if (last >= 0 && lines[last].length + separator.length + key.length <= width) lines[last] += separator + key;
+    else lines.push(key);
+  }
+  return lines.map(line => tint('2', line));
+}
+// One frame: title, the step's status line, then the Status body, the Menu
+// and the key footer — or, for the account panel, its tab bar, the active
+// tab's body and the tab's actions. The menu takes the rows it needs first
+// (a long menu scrolls behind "N above"/"N more" markers); the body gets the
+// rest and scrolls with Page Up/Down. Below sixteen rows the blank
+// separators go, so a short pane spends every row on the menu and the body.
+// A body given as a function of the width is laid out again for every
+// frame, so a resized panel re-fits its tables. Everything is redacted
+// before it is measured or cut, so a clipped value can never leave the head
+// of a key behind.
 function renderScreen(view) {
   const size = windowSize();
   const width = Math.max(20, size.columns - 4);
   const height = Math.max(8, size.rows);
-  const gap = height < 16 ? [] : [''];
+  const tabs = view.tabs ?? null;
+  const gap = height < 17 ? [] : [''];
   const options = view.options ?? [];
   if (view.selectionOptions !== options) {
     view.selectionOptions = options;
     view.selected = Math.max(0, options.findIndex(option => option.value !== BACK));
   } else if (!options[view.selected]) view.selected = Math.max(0, options.length - 1);
-  const renderedBody = Array.isArray(view.statusRows) ? renderStatus(view.statusRows, Math.min(width, 80)) : view.body;
-  const body = [view.identity, renderedBody, view.notice].filter(Boolean).join('\n\n');
+  const renderedBody = Array.isArray(view.statusRows) ? renderStatus(view.statusRows, Math.min(width, 80))
+    : typeof view.content === 'function' ? view.content(width) : view.body;
+  const body = [tabs === null ? view.identity : null, renderedBody, view.notice].filter(Boolean).join('\n\n');
   const bodyLines = wrapLines(redact(body), width);
   const head = [tint('1', clipLine(redact(view.title), width)), ...gap];
+  if (tabs !== null && view.identity) head.push(tint('2', clipLine(redact(view.identity), width)), ...gap);
   if (view.status) {
     head.push(tint(view.failed ? '31' : view.status.startsWith('Complete') ? '32' : '36', clipLine(redact(view.status), width)), ...gap);
   }
-  const footer = tint('2', [
-    utf8 ? '↑↓ navigate' : 'up/down navigate', utf8 ? '⏎ select' : 'Enter select', view.root ? 'esc quit' : 'esc back',
-  ].join(utf8 ? ' • ' : ' . '));
-  // Rows that are neither options nor body: the head, the Menu heading and
-  // the footer with their gaps, and the cursor's row under the footer.
-  const fixedRows = head.length + gap.length + 1 + gap.length + 1 + 1;
+  // The selected tab is bracketed, so it stands out without color too.
+  if (tabs !== null) {
+    head.push(clipLine(tabs.map(tab => (tab.value === view.tab ? tint('1', `[${tab.label}]`) : tint('2', tab.label))).join(' '), width), ...gap);
+  }
+  const footer = footerLines(view, width);
+  // Rows that are neither options nor body: the head, the Menu heading (the
+  // panel has none) and the footer with their gaps, and the cursor's row
+  // under the footer.
+  const fixedRows = head.length + (tabs === null && !view.prompt ? gap.length + 1 : 0) + gap.length + footer.length + 1;
   const roomForMenu = Math.max(1, height - fixedRows);
   // A scrolled menu keeps the cursor inside its window; the window gives up
   // one row per marker it actually draws.
@@ -631,9 +684,12 @@ function renderScreen(view) {
     optionRows.push(clipLine(`${cursor} ${number}  ${labels[index].padEnd(labelWidth, ' ')}${hint}`, width - 2));
   }
   if (lastOption < options.length) optionRows.push(tint('2', `${glyph.more} ${options.length - lastOption} more`));
-  let bodyRows = bodyLines.length === 0 ? 0 : Math.max(0, height - fixedRows - optionRows.length - 1);
+  // The Status heading, or the gap before the panel's actions when it has any.
+  const bodyHeadRows = tabs === null && !view.prompt ? 1 : optionRows.length > 0 ? gap.length : 0;
+  let bodyRows = bodyLines.length === 0 ? 0 : Math.max(0, height - fixedRows - optionRows.length - bodyHeadRows);
   const bodyOverflow = bodyRows > 1 && bodyLines.length > bodyRows;
   if (bodyOverflow) bodyRows -= 1;
+  view.bodyRows = bodyRows;
   const maxOffset = Math.max(0, bodyLines.length - bodyRows);
   view.offset = view.offset === Infinity
     ? maxOffset
@@ -641,10 +697,16 @@ function renderScreen(view) {
   const bodyFrame = bodyRows > 0 ? bodyLines.slice(view.offset, view.offset + bodyRows) : [];
   if (bodyOverflow) bodyFrame.push(tint('2', `${view.offset + 1}${glyph.range}${Math.min(bodyLines.length, view.offset + bodyRows)}/${bodyLines.length}`));
   const lines = [...head];
-  // A Status heading with nothing under it is noise: a pane that gave every
-  // row to the menu shows the menu alone.
-  if (bodyFrame.length > 0) lines.push(heading('Status'), ...bodyFrame);
-  lines.push(...gap, heading('Menu'), ...optionRows, ...gap, footer);
+  if (tabs === null && !view.prompt) {
+    // A Status heading with nothing under it is noise: a pane that gave every
+    // row to the menu shows the menu alone.
+    if (bodyFrame.length > 0) lines.push(heading('Status'), ...bodyFrame);
+    lines.push(...gap, heading('Menu'), ...optionRows);
+  } else {
+    lines.push(...bodyFrame);
+    if (optionRows.length > 0) lines.push(...gap, ...optionRows);
+  }
+  lines.push(...gap, ...footer);
   const margin = line => line === '' ? '' : `  ${line}`;
   term(`${ansi() ? '\x1b[H\x1b[2J' : '\f'}${lines.map(margin).join('\n')}\n`);
 }
@@ -652,11 +714,15 @@ function renderScreen(view) {
 // keeps its cursor; Escape never confirms a highlighted action. A typed
 // number moves the cursor at once; when the menu reaches the number a second
 // digit would form, the first waits briefly for it (so "12" is item 12, not
-// item 1 then item 2).
+// item 1 then item 2). A frame without options ignores keys while work runs;
+// the account panel is the exception: Left, Right, Tab and Shift-Tab flip
+// its tabs (so Left is not Back there), its hotkeys resolve to their action,
+// and a tab without actions scrolls row by row.
 async function selectScreen(view, signal, renderInitial = true) {
   const { input } = tty();
   if (signal?.aborted) return BACK;
-  let keypress, resize, abort, ended;
+  let keypress, resize, abort, ended, received;
+  let freshInput = false;
   let pendingTimer = null;
   let pendingDigits = null;
   const settlePending = () => {
@@ -667,13 +733,16 @@ async function selectScreen(view, signal, renderInitial = true) {
   try {
     return await new Promise((resolve, reject) => {
       keypress = (text, key) => {
+        // A bare ESC can finish decoding after the preceding screen closed.
+        if (key?.name === 'escape' && !freshInput) return;
         if (key?.ctrl && key.name === 'c') {
           if (view.interrupt) view.interrupt();
           else reject(new Interrupt());
           return;
         }
-        if (view.options.length === 0) return;
+        const tabbed = view.tabs !== undefined;
         const count = view.options.length;
+        if (view.interrupt || (!tabbed && count === 0)) return;
         if (/^[0-9]$/.test(text ?? '')) {
           const number = Number(`${pendingDigits ?? ''}${text}`);
           settlePending();
@@ -687,27 +756,49 @@ async function selectScreen(view, signal, renderInitial = true) {
           return;
         }
         settlePending();
-        if (key?.name === 'escape' || key?.name === 'left' || key?.name === 'backspace'
+        if (key?.name === 'escape' || (!tabbed && key?.name === 'left') || key?.name === 'backspace'
           || text === '\x7f' || (key?.ctrl && key.name === 'd') || text === 'q' || text === 'Q') {
           resolve(BACK);
           return;
         }
+        if (tabbed) {
+          if (key?.name === 'left' || key?.name === 'right' || key?.name === 'tab') {
+            const step = key.name === 'left' || key.shift ? -1 : 1;
+            const index = view.tabs.findIndex(tab => tab.value === view.tab);
+            view.tab = view.tabs[(index + step + view.tabs.length) % view.tabs.length].value;
+            resolve(SWITCH);
+            return;
+          }
+          const hotkey = view.keys?.[(text ?? '').toLowerCase()];
+          if (hotkey !== undefined) { resolve(hotkey); return; }
+        }
         if (key?.name === 'return' || key?.name === 'enter') {
-          resolve(view.options[view.selected ?? 0].value);
+          if (count > 0) resolve(view.options[view.selected ?? 0].value);
           return;
         }
-        if (key?.name === 'up' || text === 'k' || text === 'K') view.selected = ((view.selected ?? 0) + count - 1) % count;
+        const page = Math.max(1, view.bodyRows ?? 5);
+        if (key?.name === 'pageup') view.offset = Math.max(0, (view.offset ?? 0) - page);
+        else if (key?.name === 'pagedown') view.offset = (view.offset ?? 0) + page;
+        else if (tabbed && (key?.name === 'home' || key?.name === 'end')) {
+          view.offset = key.name === 'home' ? 0 : Infinity;
+        } else if (count === 0) {
+          if (key?.name === 'up' || text === 'k' || text === 'K') view.offset = Math.max(0, (view.offset ?? 0) - 1);
+          else if (key?.name === 'down' || text === 'j' || text === 'J') view.offset = (view.offset ?? 0) + 1;
+          else if (key?.name === 'home') view.offset = 0;
+          else if (key?.name === 'end') view.offset = Infinity;
+          else return;
+        } else if (key?.name === 'up' || text === 'k' || text === 'K') view.selected = ((view.selected ?? 0) + count - 1) % count;
         else if (key?.name === 'down' || text === 'j' || text === 'J') view.selected = ((view.selected ?? 0) + 1) % count;
         else if (key?.name === 'home') view.selected = 0;
         else if (key?.name === 'end') view.selected = count - 1;
-        else if (key?.name === 'pageup') view.offset = Math.max(0, (view.offset ?? 0) - 5);
-        else if (key?.name === 'pagedown') view.offset = (view.offset ?? 0) + 5;
         else return;
         renderScreen(view);
       };
       resize = () => renderScreen(view);
       abort = () => resolve(BACK);
       ended = () => resolve(BACK);
+      received = () => { freshInput = true; };
+      input.prependOnceListener('data', received);
       input.on('keypress', keypress);
       input.once('end', ended);
       process.stdout.on('resize', resize);
@@ -721,6 +812,7 @@ async function selectScreen(view, signal, renderInitial = true) {
   } finally {
     settlePending();
     input.off('keypress', keypress);
+    input.off('data', received);
     input.off('end', ended);
     process.stdout.off('resize', resize);
     signal?.removeEventListener('abort', abort);
@@ -732,7 +824,8 @@ async function selectScreen(view, signal, renderInitial = true) {
 // become an acknowledgement of its result. Prompts run outside this boundary.
 async function runProgress(view, label, work) {
   const running = {
-    title: view.title, root: view.root === true, identity: view.identity, status: `Running ${glyph.dot} ${label}`, body: '', options: [],
+    title: view.title, root: view.root === true, identity: view.identity, tabs: view.tabs, tab: view.tab,
+    status: `Running ${glyph.dot} ${label}`, body: '', options: [],
     interrupt: () => process.emit('SIGINT'),
   };
   const finished = new AbortController();
@@ -778,8 +871,13 @@ async function runProgress(view, label, work) {
     for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.off(signal, interrupt);
   }
 }
+// A result page: one Back action under the outcome. A panel that failed
+// before it could load sheds its tabs, laid-out body and hotkeys.
 function showResult(view, status, body = view.body, failed = false) {
-  Object.assign(view, { route: 'result', status, body, failed, options: [backOption], selected: 0, offset: Infinity, ready: true });
+  Object.assign(view, {
+    route: 'result', status, body, failed, options: [backOption], selected: 0, offset: Infinity, ready: true,
+    tabs: undefined, content: undefined, keys: undefined,
+  });
 }
 async function runAction(label, work, prompts = false) {
   if (!interactive() || screenOutput !== null) return work(null);
@@ -832,10 +930,12 @@ function spawnWork(command, args, options) {
 }
 // Aligned columns, two spaces apart; `right` marks right-aligned columns.
 export function table(header, rows, right = new Set()) {
-  const widths = header.map((cell, column) => Math.max(cell.length, ...rows.map(row => String(row[column]).length)));
+  const width = value => String(value).replace(ANSI_PAINT, '').length;
+  const widths = header.map((cell, column) => Math.max(width(cell), ...rows.map(row => width(row[column]))));
   const line = (row, dim) => row.map((cell, column) => {
     const text = String(cell);
-    const padded = right.has(column) ? text.padStart(widths[column]) : text.padEnd(widths[column]);
+    const padding = ' '.repeat(widths[column] - width(text));
+    const padded = right.has(column) ? padding + text : text + padding;
     return dim ? paint('2', padded) : padded;
   }).join('  ').replace(/\s+$/, '');
   return [line(header, true), ...rows.map(row => line(row, false))].join('\n');
@@ -1258,41 +1358,63 @@ const currentModelId = state => (state?.model ? rawModelId(state.model) : null);
 const number = value => (typeof value === 'number' && Number.isFinite(value) ? value : null);
 const USAGE_CATEGORIES = [
   ['input', 'input'], ['cache_write', 'cache write'], ['cache_read', 'cache read'],
-  ['output_completion', 'completion'], ['thinking', 'thinking'], ['total', 'total'],
-  ['cache_write_5m', 'cache write 5m'], ['cache_write_1h', 'cache write 1h'],
-  ['orchestration_input', 'orchestration input'], ['orchestration_cache_read', 'orchestration read'], ['orchestration_output', 'orchestration out'],
+  ['output_completion', 'completion'], ['thinking', 'thinking'],
 ];
-// One aligned table: a section per provider (all providers first) with the
-// token categories down and the windows across. Counts only; cost is metered
-// elsewhere. A window without ledger coverage shows — and is named below.
-export function renderUsage(payload) {
+const WINDOW_LABELS = { today: 'Today', '7d': 'Last 7 days', '30d': 'Last 30 days', all: 'All time' };
+// The legacy usage payload: token buckets for the four windows, each with
+// its providers. Counts only; cost is metered elsewhere.
+function checkUsage(payload) {
   const bucket = value => record(value) && record(value.tokens);
   if (!record(payload) || !record(payload.windows)
     || WINDOWS.some(key => !bucket(payload.windows[key]) || !record(payload.windows[key].providers)
       || Object.values(payload.windows[key].providers).some(value => !bucket(value)))) {
     throw new CliError('the usage payload is not in the expected shape');
   }
-  const count = value => number(value) === null ? '—' : integer(value);
-  // A provider absent from a covered window used no tokens in it; a category
-  // the payload leaves out of an existing bucket was not measured.
-  const blank = key => (number(payload.windows[key].tokens.total) === null ? null : 0);
-  const cell = (bucket, key, category) => (bucket === undefined ? blank(key) : Object.hasOwn(bucket.tokens, category) ? bucket.tokens[category] : null);
-  const gap = ['', '', '', '', ''];
-  const section = (title, pick) => [
-    [title, '', '', '', ''],
-    ...USAGE_CATEGORIES.filter(([category]) => WINDOWS.some(key => Object.hasOwn(pick(key)?.tokens ?? {}, category)))
-      .map(([category, label]) => [`  ${label}`, ...WINDOWS.map(key => count(cell(pick(key), key, category)))]),
+  return payload;
+}
+// A window without ledger coverage or with pruned history is named as such.
+const usageCoverage = (payload, key) => {
+  const status = payload.coverage?.windows?.[key]?.status;
+  return status === 'unavailable' ? 'unavailable' : status === 'partial' ? 'partial history' : null;
+};
+const usageCount = value => number(value) === null ? '—' : integer(value);
+const usageTokens = value => number(value) === null ? '—' : compactTokens(value);
+const usageProviders = payload => [...new Set(WINDOWS.flatMap(key => Object.keys(payload.windows[key].providers)))].sort((left, right) => left.localeCompare(right));
+// Total tokens and calls per window: all providers first, then a section per
+// provider. A provider absent from a covered window used nothing in it; a
+// bucket without the figure was not measured; a window without coverage
+// shows — throughout and is named below.
+export function renderUsage(payload, width = Math.max(20, windowSize().columns - 4)) {
+  checkUsage(payload);
+  const cell = (bucket, key, pick) => (bucket !== undefined ? pick(bucket) : number(payload.windows[key].tokens.total) === null ? null : 0);
+  const section = (title, pick) => `${title}\n${billingTable(['', ...WINDOWS], [
+    ['Tokens', ...WINDOWS.map(key => usageTokens(cell(pick(key), key, bucket => bucket.tokens.total)))],
+    ['Calls', ...WINDOWS.map(key => usageCount(cell(pick(key), key, bucket => bucket.calls)))],
+  ], new Set([1, 2, 3, 4]), width)}`;
+  const sections = [
+    section('All providers', key => payload.windows[key]),
+    ...usageProviders(payload).map(provider => section(provider, key => payload.windows[key].providers[provider])),
   ];
-  const providers = [...new Set(WINDOWS.flatMap(key => Object.keys(payload.windows[key].providers)))].sort((left, right) => left.localeCompare(right));
-  const rows = [
-    ...section('all providers', key => payload.windows[key]),
-    ...providers.flatMap(provider => [gap, ...section(provider, key => payload.windows[key].providers[provider])]),
-  ];
-  const coverage = WINDOWS.map(key => {
-    const status = payload.coverage?.windows?.[key]?.status;
-    return status === 'unavailable' ? `${key}: unavailable` : status === 'partial' ? `${key}: partial history` : null;
-  }).filter(line => line !== null);
-  return table(['', ...WINDOWS], rows, new Set([1, 2, 3, 4])) + (coverage.length > 0 ? `\n\n${coverage.join(`  ${glyph.dot}  `)}` : '');
+  const coverage = WINDOWS.map(key => { const note = usageCoverage(payload, key); return note === null ? null : `${key}: ${note}`; }).filter(line => line !== null);
+  if (coverage.length > 0) sections.push(coverage.join('\n'));
+  return sections.join('\n\n');
+}
+// One window: its calls, errors and total tokens, then each token category
+// with its share of the window's total, for all providers and per provider.
+export function renderUsageStats(payload, window, width = Math.max(20, windowSize().columns - 4)) {
+  checkUsage(payload);
+  const bucket = payload.windows[window];
+  const share = (value, total) => (number(value) === null || number(total) === null || total === 0 ? '—' : percent(value / total));
+  const categories = source => billingTable(['Category', 'Tokens', 'Share'], USAGE_CATEGORIES
+    .filter(([category]) => Object.hasOwn(source.tokens, category))
+    .map(([category, label]) => [label, usageTokens(source.tokens[category]), share(source.tokens[category], source.tokens.total)]), new Set([1, 2]), width);
+  const coverage = usageCoverage(payload, window);
+  return [
+    `${WINDOW_LABELS[window]}${coverage === null ? '' : ` ${glyph.dot} ${coverage}`}`,
+    pairs([['Calls', usageCount(bucket.calls)], ['Errors', usageCount(bucket.errors)], ['Total tokens', usageTokens(bucket.tokens.total)]]),
+    `All providers\n${categories(bucket)}`,
+    ...Object.keys(bucket.providers).sort((left, right) => left.localeCompare(right)).map(provider => `${provider}\n${categories(bucket.providers[provider])}`),
+  ].join('\n\n');
 }
 export function renderCapacity(payload, nowMs = Date.now()) {
   if (!record(payload) || !Array.isArray(payload.providers)) throw new CliError('the capacity payload is not in the expected shape');
@@ -1335,6 +1457,166 @@ export function renderConnections(payload, nowMs = Date.now()) {
     countdown(connection.resetsAt, nowMs),
   ]);
   return table(['provider', 'account', 'plan', 'worker', 'state', 'weekly', 'fable', 'reset'], rows, new Set([5, 6]));
+}
+
+const tokenFormat = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
+const compactTokens = value => tokenFormat.format(value);
+const money = value => value > 0 && value < 0.01 ? '<$0.01' : `$${value.toLocaleString('en-US', {
+  minimumFractionDigits: 2, maximumFractionDigits: 2,
+})}`;
+const rateMoney = value => `$${value.toLocaleString('en-US', { maximumFractionDigits: 6 })}`;
+const savedPercent = value => number(value) === null ? '—' : `${amount(value)}%`;
+const limitMoney = value => value === null ? 'Unlimited' : money(value);
+const billingPeriod = value => value === 'month' || value === 'all' || /^(?:19[7-9]\d|[2-9]\d{3})-(?:0[1-9]|1[0-2])$/.test(value)
+  ? { value } : { error: 'use month, all or YYYY-MM' };
+const budgetValue = (value, empty) => {
+  if (value === empty) return { value: null };
+  if (!/^\d+(?:\.\d+)?$/.test(value) || !Number.isFinite(Number(value))) return { error: `enter USD or ${empty}` };
+  return { value: Number(value) };
+};
+
+// A table that fits the width, else one label/value line per cell.
+function billingTable(header, rows, right, width) {
+  const rendered = table(header, rows, right);
+  if (rendered.split('\n').every(line => line.replace(ANSI_PAINT, '').length <= width)) return rendered;
+  return rows.map(row => header.map((label, index) => {
+    const value = String(row[index]);
+    return label.length + 2 + value.replace(ANSI_PAINT, '').length <= width
+      ? `${label}  ${value}`.trim() : `${label}\n${value}`;
+  }).join('\n')).join('\n\n');
+}
+// Aligned label/value pairs, the values right-aligned, two spaces apart.
+function pairs(rows) {
+  const width = value => String(value).replace(ANSI_PAINT, '').length;
+  const labelWidth = Math.max(...rows.map(([label]) => label.length));
+  const valueWidth = Math.max(...rows.map(([, value]) => width(value)));
+  return rows.map(([label, value]) => `${label.padEnd(labelWidth)}  ${' '.repeat(valueWidth - width(value))}${value}`).join('\n');
+}
+
+// The account's own ledger statement, as /admin/api/cli/billing serves it.
+// Every figure a renderer prints is checked here, so a panel frame never
+// meets a missing one.
+const statementRow = value => record(value) && number(value.totalTokens) !== null && number(value.apiCostUsd) !== null
+  && number(value.chargedUsd) !== null && (value.discountPercent === null || number(value.discountPercent) !== null)
+  && number(value.calls) !== null && number(value.unresolvedCalls) !== null;
+function checkBilling(payload) {
+  if (!record(payload) || typeof payload.period !== 'string' || typeof payload.meteredSince !== 'string' || number(payload.pendingCalls) === null
+    || !statementRow(payload.totals)
+    || !Array.isArray(payload.models) || !payload.models.every(model => statementRow(model) && typeof model.modelId === 'string')
+    || !record(payload.currentMonth) || typeof payload.currentMonth.period !== 'string'
+    || number(payload.currentMonth.chargedUsd) === null || number(payload.currentMonth.reservedUsd) === null
+    || !Array.isArray(payload.currentMonth.models)
+    || !payload.currentMonth.models.every(model => record(model) && typeof model.modelId === 'string'
+      && number(model.chargedUsd) !== null && number(model.reservedUsd) !== null)
+    || !record(payload.limits) || (payload.limits.monthlyLimitUsd !== null && number(payload.limits.monthlyLimitUsd) === null)
+    || !Array.isArray(payload.limits.modelLimits)
+    || !payload.limits.modelLimits.every(limit => record(limit) && typeof limit.modelId === 'string' && number(limit.monthlyLimitUsd) !== null)) {
+    throw new CliError('the billing payload is not in the expected shape');
+  }
+  return payload;
+}
+const rateCard = value => record(value) && ['input', 'output', 'cacheRead', 'cacheWrite', 'cacheWrite1h'].every(key => value[key] === undefined || number(value[key]) !== null);
+function checkPricing(payload) {
+  if (!record(payload) || !Array.isArray(payload.models) || !payload.models.every(model => record(model) && typeof model.id === 'string'
+    && rateCard(model.api) && rateCard(model.genesis)
+    && (model.longContext === undefined || record(model.longContext) && number(model.longContext.inputThreshold) !== null
+      && rateCard(model.longContext.api) && rateCard(model.longContext.genesis)))) {
+    throw new CliError('the pricing payload is not in the expected shape');
+  }
+  return payload;
+}
+const statementPeriod = payload => payload.period === 'all' ? 'All time'
+  : payload.period === 'month' ? `This month ${glyph.dot} ${payload.currentMonth.period}` : payload.period;
+// Current-month holds and running calls are shown with any period: they are
+// what stands against the limits right now. One line when it fits.
+function statementStatus(payload, width) {
+  const status = [];
+  if (payload.pendingCalls > 0) status.push(`Running ${integer(payload.pendingCalls)}`);
+  if (payload.totals.unresolvedCalls > 0) status.push(`Unresolved ${integer(payload.totals.unresolvedCalls)}`);
+  if (payload.currentMonth.reservedUsd > 0) status.push(`Reserved ${money(payload.currentMonth.reservedUsd)}`);
+  const line = status.join(` ${glyph.dot} `);
+  return [...(line.length <= width ? [line] : status), `Metered since ${payload.meteredSince.slice(0, 10)}`].filter(Boolean).join('\n');
+}
+
+// The statement: total tokens, what the provider's list price would have
+// cost (struck through), what Genesis charged and the saving, then the same
+// per model. Money is what each call was charged when it settled.
+export function renderBilling(payload, width = Math.max(20, windowSize().columns - 4)) {
+  checkBilling(payload);
+  const labels = ['Tokens', 'API equivalent', 'Genesis', 'Saved'];
+  const row = value => [compactTokens(value.totalTokens), paint('9', money(value.apiCostUsd)), money(value.chargedUsd), savedPercent(value.discountPercent)];
+  const sections = [
+    `${statementPeriod(payload)} ${glyph.dot} USD`,
+    pairs(row(payload.totals).map((value, index) => [labels[index], value])),
+  ];
+  if (payload.models.length > 0) {
+    sections.push(billingTable(['Model', 'Tokens', 'API equivalent', 'Genesis', 'Saved'],
+      payload.models.map(model => [model.modelId, ...row(model)]), new Set([1, 2, 3, 4]), width));
+  }
+  sections.push(statementStatus(payload, width));
+  return sections.join('\n\n');
+}
+
+// The same statement as counts: calls and tokens, then each model's tokens,
+// its share of them and its calls, the largest first.
+export function renderStats(payload, width = Math.max(20, windowSize().columns - 4)) {
+  checkBilling(payload);
+  const total = payload.totals.totalTokens;
+  const overview = [['Calls', integer(payload.totals.calls)], ['Total tokens', compactTokens(total)]];
+  if (payload.pendingCalls > 0) overview.push(['Running', integer(payload.pendingCalls)]);
+  if (payload.totals.unresolvedCalls > 0) overview.push(['Unresolved', integer(payload.totals.unresolvedCalls)]);
+  const sections = [statementPeriod(payload), pairs(overview)];
+  if (payload.models.length > 0) {
+    const models = [...payload.models].sort((left, right) => right.totalTokens - left.totalTokens || left.modelId.localeCompare(right.modelId));
+    sections.push(billingTable(['Model', 'Tokens', 'Share', 'Calls'], models.map(model => [
+      model.modelId, compactTokens(model.totalTokens), total > 0 ? percent(model.totalTokens / total) : '—', integer(model.calls),
+    ]), new Set([1, 2, 3]), width));
+  }
+  sections.push(`Metered since ${payload.meteredSince.slice(0, 10)}`);
+  return sections.join('\n\n');
+}
+
+// The current month against its limits, whatever period the statement shows.
+export function renderLimits(payload, width = Math.max(20, windowSize().columns - 4)) {
+  checkBilling(payload);
+  const current = payload.currentMonth;
+  const rows = [
+    ['Monthly limit', limitMoney(payload.limits.monthlyLimitUsd)],
+    ['Charged', money(current.chargedUsd)],
+  ];
+  if (current.reservedUsd > 0) rows.push(['Reserved', money(current.reservedUsd)]);
+  if (payload.pendingCalls > 0) rows.push(['Running', integer(payload.pendingCalls)]);
+  const sections = [`This month ${glyph.dot} ${current.period} ${glyph.dot} USD`, pairs(rows)];
+  for (const limit of payload.limits.modelLimits) {
+    const model = current.models.find(entry => entry.modelId === limit.modelId);
+    const headers = ['Monthly limit', 'Charged'];
+    const values = [money(limit.monthlyLimitUsd), money(model?.chargedUsd ?? 0)];
+    if ((model?.reservedUsd ?? 0) > 0) {
+      headers.push('Reserved');
+      values.push(money(model.reservedUsd));
+    }
+    sections.push(`${limit.modelId}\n${billingTable(headers, [values], new Set([0, 1, 2]), width)}`);
+  }
+  return sections.join('\n\n');
+}
+
+export function renderPricing(payload, width = Math.max(20, windowSize().columns - 4)) {
+  checkPricing(payload);
+  const rates = (api, genesis) => billingTable(['Per 1M tokens', 'Provider API', 'Genesis'], [
+    ['Input', 'input'], ['Output', 'output'], ['Cache read', 'cacheRead'],
+    ['Cache write', 'cacheWrite'], ['Cache write 1h', 'cacheWrite1h'],
+  ].filter(([, key]) => typeof api[key] === 'number' && typeof genesis[key] === 'number' && (api[key] > 0 || key === 'input' || key === 'output'))
+    .map(([label, key]) => [label, rateMoney(api[key]), rateMoney(genesis[key])]), new Set([1, 2]), width);
+  return payload.models.map(model => {
+    const sections = [`${model.id}\n${paint('1;32', `${savedPercent(model.discountPercent)} off`)} ${glyph.dot} USD`, rates(model.api, model.genesis)];
+    if (model.longContext) {
+      const long = model.longContext;
+      sections.push(`Input ${long.inputThresholdInclusive ? '≥' : '>'} ${compactTokens(long.inputThreshold)} tokens\n${rates(long.api, long.genesis)}`);
+    }
+    if (record(model.serviceTierCost)) sections.push(billingTable(['Service tier', 'Rate multiplier'],
+      Object.entries(model.serviceTierCost).map(([name, factor]) => [name, `${factor}×`]), new Set([1]), width));
+    return sections.join('\n\n');
+  }).join('\n\n');
 }
 
 // ── commands ────────────────────────────────────────────────────────────────
@@ -1549,12 +1831,87 @@ async function model(session, client, requested, flags) {
     return configure(session, client, { ...flags, model: choice }, view);
   }, true);
 }
-async function showUsage(session, flags) {
-  const payload = await api(session, 'GET', '/admin/api/cli/usage');
-  if (flags.json) { out(JSON.stringify(payload, null, 2)); return; }
-  out(paint('1', `usage ${glyph.dot} ${environmentLabel(session.environment)} ${glyph.dot} ${session.name}`));
-  out('');
-  out(renderUsage(payload));
+const readBilling = (session, period = 'month') => api(session, 'GET', `/admin/api/cli/billing?period=${encodeURIComponent(period)}`);
+function currentSession(session, payload) {
+  const value = validateMe(payload);
+  if (value.name === session.name && value.role === session.role && value.email === session.email
+    && value.identityClass === session.identityClass) return session;
+  const next = { ...session, ...value };
+  saveSession(next);
+  return next;
+}
+// usage, billing, stats, pricing and read-only limits: on a terminal the
+// account panel opens on the command's tab (billing enters Usage) and Esc
+// exits; without one, or with --json, the same data is one-shot text or
+// JSON. A limit mutation is always one-shot. External statements use the
+// ledger; internal usage and stats use the legacy token windows.
+async function account(command, flags) {
+  const mutation = flags.monthly !== undefined || flags.limit !== undefined;
+  if (interactive() && !flags.json && !mutation) {
+    const environment = environmentId(flags.environment ?? loadStore().environment);
+    if (loadSession(environment) === null) throw notLoggedIn(environment);
+    await dashboard(flags, {
+      command, tab: ACCOUNT_COMMANDS[command], period: flags.period,
+    });
+    return;
+  }
+  let session = await requireSession(flags);
+  session = currentSession(session, await api(session, 'GET', '/admin/api/cli/me'));
+  const json = payload => JSON.stringify(payload, null, 2);
+  const internalUsage = session.identityClass !== 'external' && ['usage', 'stats'].includes(command);
+  if (internalUsage && flags.period !== undefined && flags.period !== 'all') {
+    throw usage('internal usage supports --period all only');
+  }
+  if (command === 'limits') {
+    if (session.identityClass !== 'external' && !mutation) {
+      if (flags.json) out(json(await readBilling(session)));
+      else {
+        out(paint('1', `${command} ${glyph.dot} ${environmentLabel(session.environment)} ${glyph.dot} ${session.name}`));
+        out('');
+        out('Unbilled internal account');
+      }
+      return;
+    }
+    const payload = await changeLimits(session, flags);
+    out(flags.json ? json(payload) : renderLimits(payload));
+  } else if (command === 'pricing') {
+    const payload = await api(session, 'GET', '/admin/api/cli/pricing');
+    out(flags.json ? json(payload) : renderPricing(payload));
+  } else if (internalUsage) {
+    const payload = await api(session, 'GET', '/admin/api/cli/usage');
+    if (flags.json) { out(json(payload)); return; }
+    out(paint('1', `${command} ${glyph.dot} ${environmentLabel(session.environment)} ${glyph.dot} ${session.name}`));
+    out('');
+    out(command === 'stats' ? renderUsageStats(payload, 'all') : renderUsage(payload));
+  } else {
+    const payload = await readBilling(session, flags.period);
+    out(flags.json ? json(payload) : `${paint('1', `${command} ${glyph.dot} ${environmentLabel(session.environment)} ${glyph.dot} ${session.name}`)}\n\n${command === 'stats' ? renderStats(payload) : renderBilling(payload)}`);
+  }
+}
+async function changeLimits(session, flags, onDispatch = null) {
+  const payload = await readBilling(session);
+  if (flags.monthly === undefined && flags.limit === undefined) return payload;
+  const limits = { ...payload.limits, modelLimits: [...payload.limits.modelLimits] };
+  if (flags.monthly !== undefined) {
+    const parsed = budgetValue(flags.monthly, 'unlimited');
+    if (parsed.error) throw usage(parsed.error);
+    limits.monthlyLimitUsd = parsed.value;
+  }
+  if (flags.limit !== undefined) {
+    const parsed = budgetValue(flags.limit, 'none');
+    if (parsed.error) throw usage(parsed.error);
+    limits.modelLimits = limits.modelLimits.filter(entry => entry.modelId !== flags.model);
+    if (parsed.value !== null) limits.modelLimits.push({ modelId: flags.model, monthlyLimitUsd: parsed.value });
+  }
+  if (workContext.getStore()?.signal.aborted) throw new Interrupt();
+  onDispatch?.();
+  return api(session, 'POST', '/admin/api/cli/billing/limits', limits, HTTP_TIMEOUT_MS, true);
+}
+async function consoleLink(session) {
+  const payload = await api(session, 'POST', '/admin/api/cli/billing/session', {}, HTTP_TIMEOUT_MS, true);
+  const url = new URL(payload.url);
+  if (url.origin !== new URL(session.endpoint).origin || url.pathname !== '/admin/') throw new CliError('the console link has an unexpected origin or path');
+  return payload.url;
 }
 async function showCapacity(session) {
   out(renderCapacity(await api(session, 'GET', '/admin/api/cli/capacity')));
@@ -2294,18 +2651,90 @@ async function update() {
   });
 }
 
+// ── account panel ───────────────────────────────────────────────────────────
+// One tabbed panel for what an account reads about itself: Usage, Stats,
+// Limits and Pricing (an internal account is unbilled, so it has no Limits).
+// An external account's Usage and Stats are two views of the same ledger
+// statement for one shared period — this month, all time or a chosen month;
+// Limits always shows the current month. An internal account keeps the
+// legacy token windows: Usage shows all four, Stats one at a time.
+const ACCOUNT_TABS = [['usage', 'Usage'], ['stats', 'Stats'], ['limits', 'Limits'], ['pricing', 'Pricing']];
+const ACCOUNT_COMMANDS = { usage: 'usage', billing: 'usage', stats: 'stats', pricing: 'pricing', limits: 'limits' };
+const accountTabs = session => ACCOUNT_TABS
+  .filter(([value]) => value !== 'limits' || session.identityClass === 'external')
+  .map(([value, label]) => ({ value, label }));
+const accountFields = (session, entry) => ({
+  tabs: accountTabs(session), tab: entry.tab, billing: entry.command === 'billing',
+  period: entry.period ?? 'month', window: 'all', payloads: {},
+});
+// Which payload the active tab shows. Explicit billing retains a prior ledger
+// statement after reclassification; ordinary internal usage never reads it.
+const accountKey = (session, view) => (view.tab === 'pricing' ? 'pricing'
+  : session.identityClass !== 'external' && !(view.billing && view.tab === 'usage') ? 'usage'
+    : `billing:${view.tab === 'limits' ? 'month' : view.period}`);
+// The hotkeys a tab answers to, as the footer names them.
+const accountKeys = (session, view) => ({
+  ...((session.identityClass === 'external' || view.billing) && view.tab === 'usage'
+    || session.identityClass === 'external' && view.tab === 'stats' ? { r: 'period', m: 'month' } : {}),
+  ...(session.identityClass !== 'external' && view.tab === 'stats' ? { r: 'window' } : {}),
+  f: 'refresh',
+});
+async function loadAccountTab(session, view) {
+  const key = accountKey(session, view);
+  if (Object.hasOwn(view.payloads, key)) return;
+  view.payloads[key] = key === 'pricing' ? checkPricing(await api(session, 'GET', '/admin/api/cli/pricing'))
+    : key === 'usage' ? checkUsage(await api(session, 'GET', '/admin/api/cli/usage'))
+      : checkBilling(await readBilling(session, key.slice('billing:'.length)));
+}
+// The active tab from its loaded payload: the body laid out for the frame's
+// width, the tab's actions (Limits alone has any) and its hotkeys. False
+// when the payload is not loaded yet.
+function renderAccountTab(session, view) {
+  const payload = view.payloads[accountKey(session, view)];
+  if (payload === undefined) return false;
+  const statement = accountKey(session, view).startsWith('billing:');
+  const tab = view.tab;
+  Object.assign(view, {
+    status: undefined, failed: false, body: '', offset: 0, keys: accountKeys(session, view),
+    content: width => (tab === 'pricing' ? renderPricing(payload, width)
+      : tab === 'limits' ? renderLimits(payload, width)
+        : statement ? (tab === 'usage' ? renderBilling(payload, width) : renderStats(payload, width))
+          : tab === 'usage' ? renderUsage(payload, width) : renderUsageStats(payload, view.window, width)),
+    options: tab === 'limits'
+      ? [{ value: 'monthly', label: 'Monthly limit' }, { value: 'models', label: 'Model limit' }, { value: 'console', label: 'Console' }]
+      : [],
+  });
+  return true;
+}
+// The panel's active tab, loaded. Every load but a tab switch starts from an
+// empty cache — f, a period change and a saved limit all want fresh rows —
+// while a switch reuses what this generation already loaded. A failed load
+// leaves the tab explicit, its message where the rows would be, until a
+// refresh succeeds.
+async function prepareAccount(session, view) {
+  view.tabs = accountTabs(session);
+  if (!view.tabs.some(tab => tab.value === view.tab)) view.tab = view.tabs[0].value;
+  if (view.keep !== true) view.payloads = {};
+  delete view.keep;
+  try {
+    await loadAccountTab(session, view);
+    renderAccountTab(session, view);
+  } catch (error) {
+    if (error instanceof Interrupt || workContext.getStore()?.signal.aborted) throw error;
+    const label = view.tabs.find(tab => tab.value === view.tab).label;
+    Object.assign(view, {
+      status: `Failed ${glyph.dot} Loading ${label}`, failed: true, body: error.message || String(error), content: undefined,
+      offset: 0, options: [], keys: accountKeys(session, view),
+    });
+  }
+}
+
 // ── dashboard ───────────────────────────────────────────────────────────────
 async function refreshIdentity(session, view) {
   try {
     const value = await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me'));
     view.prodDev = session.environment === 'prod' && isProdDev(value);
-    const identity = validateMe(value);
-    if (identity.name !== session.name || identity.role !== session.role || identity.email !== session.email || identity.identityClass !== session.identityClass) {
-      const next = { ...session, ...identity };
-      saveSession(next);
-      return next;
-    }
-    return session;
+    return currentSession(session, value);
   } catch (error) {
     view.prodDev = false;
     if (error instanceof HttpError && error.status === 401) {
@@ -2316,11 +2745,15 @@ async function refreshIdentity(session, view) {
     return session;
   }
 }
-async function dashboard(flags) {
+// `entry` opens the account panel directly over the main menu, which is
+// never shown: leaving the panel (or acknowledging a failure that stopped it
+// opening) ends the session, and such a failure exits 1.
+async function dashboard(flags, entry = null) {
   if (!interactive()) throw usage('no terminal; run a command instead (genesis --help)');
   let environment = environmentId(flags.environment ?? loadStore().environment);
   let session = loadSession(environment);
   let prodDev = false;
+  let failed = false;
   const stack = [{ route: 'dashboard', title: 'genesis', selected: 0, root: true, ready: false }];
   const pendingClosures = new Set();
   const navigation = new AbortController();
@@ -2336,12 +2769,14 @@ async function dashboard(flags) {
   const push = (route, label, fields = {}) => stack.push({
     route, title: `${stack.at(-1).title} ${glyph.step} ${label}`, selected: 0, ready: false, ...fields,
   });
+  const fail = (view, status, body) => { failed = true; showResult(view, status, body, true); };
   // Read-only pages keep a prepared parent in memory. A mutation invalidates
   // every ancestor so that a client list never displays state from before an
-  // action was acknowledged.
+  // action was acknowledged. A direct command ends when its panel is left.
   const pop = (mutating = false) => {
     stack.pop();
     if (mutating) for (const parent of stack) parent.ready = false;
+    if (entry !== null && stack.length === 1) { stack.length = 0; return; }
     // The menu returned to starts at its first action again; only its data
     // is kept.
     const parent = stack.at(-1);
@@ -2368,7 +2803,7 @@ async function dashboard(flags) {
       try { await authorizeSecondary(stack[0]); } catch (error) {
         if (error instanceof Interrupt) throw error;
         push('result', 'Prod access');
-        showResult(stack.at(-1), `Failed ${glyph.dot} Prod access`, error.message, true);
+        fail(stack.at(-1), `Failed ${glyph.dot} Prod access`, error.message);
       }
     }
     if (session !== null) {
@@ -2378,12 +2813,21 @@ async function dashboard(flags) {
       if (environment === 'prod') prodDev = initial.prodDev;
       if (session === null) {
         push('result', 'Saved login', { endpoint });
-        showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`,
-          `${hostOf(endpoint)} no longer accepts the stored key; log in again`, true);
-      } else if (initial.notice) {
-        push('result', 'Connection error');
-        showResult(stack.at(-1), `Failed ${glyph.dot} Check saved login`, initial.notice, true);
-        delete initial.notice;
+        fail(stack.at(-1), `Failed ${glyph.dot} Check saved login`, `${hostOf(endpoint)} no longer accepts the stored key; log in again`);
+      } else {
+        if (entry !== null) {
+          if (session.identityClass !== 'external' && ['usage', 'stats'].includes(entry.command)
+            && entry.period !== undefined && entry.period !== 'all') throw usage('internal usage supports --period all only');
+          if (session.identityClass !== 'external' && entry.command === 'limits') {
+            push('result', 'Limits', { root: true });
+            showResult(stack.at(-1), 'Unbilled internal account', '');
+          } else push('usage', 'Usage', { root: true, ...accountFields(session, entry) });
+        }
+        if (initial.notice) {
+          push('result', 'Connection error');
+          fail(stack.at(-1), `Failed ${glyph.dot} Check saved login`, initial.notice);
+          delete initial.notice;
+        }
       }
     }
     while (stack.length > 0) {
@@ -2426,6 +2870,45 @@ async function dashboard(flags) {
           pop(connected() > 0);
           continue;
         }
+        if (view.route === 'console') {
+          if (environment !== 'prod') await authorizeSecondary(view);
+          view.body = await runProgress(view, 'Console link', () => consoleLink(session));
+          showResult(view, `Console ${glyph.dot} ${session.name}`);
+          continue;
+        }
+        if (view.route === 'limitEdit') {
+          if (environment !== 'prod') await authorizeSecondary(view);
+          const model = view.modelId;
+          renderScreen({ ...view, prompt: true, body: '', options: [] });
+          const label = model ? `${model} monthly USD` : 'Monthly USD';
+          const value = await ask(label, text => budgetValue(text, model ? 'none' : 'unlimited'), label, null, true);
+          if (value === PROMPT_CANCEL) { pop(); continue; }
+          let payload;
+          let dispatched = false;
+          try {
+            payload = await runProgress(view, 'Saving limits', () => changeLimits(session, model
+              ? { model, limit: value === null ? 'none' : String(value) }
+              : { monthly: value === null ? 'unlimited' : String(value) }, () => { dispatched = true; }));
+          } catch (error) {
+            if (error instanceof Interrupt && dispatched) view.body = 'The limit update may have completed; check genesis limits.';
+            throw error;
+          }
+          view.mutating = true;
+          view.body = renderLimits(payload);
+          showResult(view, 'Limits saved');
+          continue;
+        }
+        if (view.route === 'billingMonth') {
+          renderScreen({ ...view, prompt: true, body: '', options: [] });
+          const period = await ask('Period', billingPeriod, 'Period', null, true);
+          const parent = stack.at(-2);
+          pop();
+          if (period !== PROMPT_CANCEL) {
+            parent.period = period;
+            parent.ready = false;
+          }
+          continue;
+        }
         if (view.route === 'smoke') {
           // Staging is only reached with live Prod developer access: the
           // recheck happens here, before any request, like every other
@@ -2439,7 +2922,7 @@ async function dashboard(flags) {
         if (view.route === 'dashboard' && view.ready && view.stateKey !== stateKey()) view.ready = false;
         if (!view.ready) {
           const prepare = async () => {
-            if (environment !== 'prod' && ['model', 'usage', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary(view);
+            if (environment !== 'prod' && ['model', 'usage', 'limitModels', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary(view);
             if (view.route === 'dashboard') {
               // refreshIdentity() is the sole /me read for this dashboard.
               // In particular, do not turn a prepared main menu into a
@@ -2456,8 +2939,11 @@ async function dashboard(flags) {
                 : [
                   ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
                   { value: 'apply', label: 'Apply', hint: `configure installed clients for ${environmentLabel(environment)}` },
-                  { value: 'clients', label: 'Clients' }, { value: 'usage', label: 'Usage' },
-                  ...(['owner', 'admin'].includes(session.role) ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
+                  { value: 'clients', label: 'Clients' },
+                  { value: 'usage', label: 'Usage', hint: accountTabs(session).map(tab => tab.label.toLowerCase()).join(` ${glyph.dot} `) },
+                  { value: 'console', label: 'Console' },
+                  ...(session.role === 'owner' || session.role === 'admin' && session.identityClass === 'internal'
+                    ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
                   { value: 'smoke', label: 'Smoke', hint: ['health', 'login', 'models', 'one real call per provider'].join(` ${glyph.dot} `) },
                   { value: 'key', label: 'Key', hint: ['rotate', 'change gateway URL or key'].join(` ${glyph.dot} `) },
                   { value: 'logout', label: 'Log out' }, { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
@@ -2488,8 +2974,15 @@ async function dashboard(flags) {
               const current = currentModelId(readState((await resolveScope(view.row.client, view.row.profile || undefined)).stateFile, view.row.client.id));
               view.options = [...modelOptions(models, current), backOption];
             } else if (view.route === 'usage') {
-              view.body = renderUsage(await api(session, 'GET', '/admin/api/cli/usage'));
-              view.options = [backOption];
+              await prepareAccount(session, view);
+            } else if (view.route === 'limitModels') {
+              const [pricing, billing] = await Promise.all([
+                api(session, 'GET', '/admin/api/cli/pricing').then(checkPricing), readBilling(session),
+              ]);
+              const models = new Set(pricing.models.map(model => model.id));
+              for (const limit of billing.limits.modelLimits) models.add(limit.modelId);
+              view.options = [...models].map(modelId => ({ value: modelId, label: modelId }));
+              view.options.push(backOption);
             } else if (view.route === 'capacity') {
               view.body = renderCapacity(await api(session, 'GET', '/admin/api/cli/capacity'));
               view.options = [backOption];
@@ -2502,8 +2995,9 @@ async function dashboard(flags) {
               view.options = [{ value: 'apply', label: view.actionLabel }, backOption];
             }
           };
-          if (['dashboard', 'clients', 'actions', 'model', 'usage', 'capacity', 'connections'].includes(view.route)) {
-            await runProgress(view, `Loading ${view.title.split(` ${glyph.step} `).at(-1)}`, prepare);
+          if (['dashboard', 'clients', 'actions', 'model', 'usage', 'limitModels', 'capacity', 'connections'].includes(view.route)) {
+            const label = view.route === 'usage' ? view.tabs.find(tab => tab.value === view.tab)?.label ?? 'Usage' : view.title.split(` ${glyph.step} `).at(-1);
+            await runProgress(view, `Loading ${label}`, prepare);
           } else await prepare();
           view.ready = true;
           view.stateKey = stateKey();
@@ -2527,6 +3021,7 @@ async function dashboard(flags) {
           }
           if (['apply', 'logout', 'update'].includes(choice)) push('confirm', label, { action: choice, actionLabel: label, mutating: true });
           else if (choice === 'key' || choice === 'smoke') push(choice, label);
+          else if (choice === 'usage') push('usage', label, accountFields(session, { tab: 'usage', period: 'month' }));
           else push(choice, label, { mutating: choice === 'login' });
         } else if (view.route === 'environment') {
           const next = await selectEnvironment(choice, view);
@@ -2547,6 +3042,24 @@ async function dashboard(flags) {
           else push('confirm', label, { row: view.row, action: choice, actionLabel: label, mutating: true });
         } else if (view.route === 'model') {
           push('confirm', choice, { row: view.row, action: 'configure', actionLabel: 'Configure', model: choice, mutating: true });
+        } else if (view.route === 'usage') {
+          // A tab loaded in this generation shows at once; another loads
+          // when it is shown. Every hotkey that changes the data reloads it.
+          if (choice === SWITCH) {
+            if (!renderAccountTab(session, view)) { view.keep = true; view.ready = false; }
+          } else if (choice === 'period') {
+            view.period = view.period === 'month' ? 'all' : 'month';
+            view.ready = false;
+          } else if (choice === 'window') {
+            view.window = WINDOWS[(WINDOWS.indexOf(view.window) + 1) % WINDOWS.length];
+            renderAccountTab(session, view);
+          } else if (choice === 'month') push('billingMonth', 'Choose month');
+          else if (choice === 'refresh') view.ready = false;
+          else if (choice === 'monthly') push('limitEdit', 'Monthly limit', { modelId: null });
+          else if (choice === 'models') push('limitModels', 'Model limit');
+          else if (choice === 'console') push('console', 'Console');
+        } else if (view.route === 'limitModels') {
+          push('limitEdit', choice, { modelId: choice });
         } else if (view.route === 'connections') {
           push('add', 'Add connection');
         } else if (view.route === 'confirm') {
@@ -2574,8 +3087,11 @@ async function dashboard(flags) {
           throw error;
         }
         const resultLabel = view.actionLabel ? `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}` : view.title.split(` ${glyph.step} `).at(-1);
-        showResult(view, `Failed ${glyph.dot} ${resultLabel}`,
-          [error.message || String(error), view.body].filter(Boolean).join('\n\n'), true);
+        const body = [error.message || String(error), view.body].filter(Boolean).join('\n\n');
+        // The panel itself failing (its authorization, not one of its
+        // actions) is a failed direct command.
+        if (view.route === 'usage') fail(view, `Failed ${glyph.dot} ${resultLabel}`, body);
+        else showResult(view, `Failed ${glyph.dot} ${resultLabel}`, body, true);
       }
     }
   } finally {
@@ -2586,6 +3102,7 @@ async function dashboard(flags) {
     closeTerminal();
     if (interruptedView !== null) { out(interruptedView.status); out(interruptedView.body); }
   }
+  if (entry !== null && failed) throw new CliError('', 1);
 }
 
 // ── arguments ───────────────────────────────────────────────────────────────
@@ -2602,7 +3119,12 @@ const HELP = `Usage: genesis [command] [options]
   disable <client> [--profile P]            local; no login required
   enable | unset <client> [--profile P]
   model <client> [ID] [--profile P]         list or pick the client's default model
-  usage [--json]                            your recorded usage
+  usage [--json] [--period month|all|YYYY-MM]   tokens and charges; on a terminal, the Usage/Stats/Limits/Pricing panel
+  stats [--json] [--period month|all|YYYY-MM]   calls and token shares
+  billing [--json] [--period month|all|YYYY-MM]
+  pricing [--json]                          current model prices and discounts
+  limits [--json] [--monthly USD|unlimited] [--model ID --limit USD|none]
+  console                                   one-time browser login link
   capacity                                  owner/admin
   connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
   smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
@@ -2613,7 +3135,7 @@ const HELP = `Usage: genesis [command] [options]
 Environment override: --environment prod | staging (does not change the saved selection)
 Clients: ${CLIENTS.map(client => client.id).join(', ')}
 Exit codes: 0 ok, 1 failure, 2 usage`;
-const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port']);
+const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port', 'period', 'monthly', 'limit']);
 const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json']);
 export function parseArgs(argv) {
   const positionals = [];
@@ -2641,7 +3163,10 @@ async function main(argv) {
   if (flags.help || command === 'help') { out(HELP); return; }
   if (flags.version) { out(`genesis ${releaseInfo()?.commit ?? 'source'}`); return; }
   if (flags.url !== undefined && !['login', 'setup'].includes(command)) throw usage('--url is only accepted by login and setup; it never retargets a stored key');
-  if (flags.json && !['usage', 'smoke'].includes(command)) throw usage('--json is only accepted by usage and smoke');
+  if (flags.json && !['usage', 'stats', 'smoke', 'billing', 'pricing', 'limits'].includes(command)) throw usage('--json is only accepted by usage, stats, smoke, billing, pricing and limits');
+  if (flags.period !== undefined && (!['usage', 'stats', 'billing'].includes(command) || billingPeriod(flags.period).error)) throw usage('--period needs month, all or YYYY-MM on usage, stats or billing');
+  if ((flags.monthly !== undefined || flags.limit !== undefined) && command !== 'limits') throw usage('--monthly and --limit are only accepted by limits');
+  if (command === 'limits' && ((flags.model === undefined) !== (flags.limit === undefined))) throw usage('a model limit needs both --model and --limit');
   if (flags.update || command === 'update') { await update(); return; }
   const expect = count => { if (rest.length !== count) throw usage(`${command} takes ${count === 0 ? 'no arguments' : `${count} argument${count === 1 ? '' : 's'}`}; see genesis --help`); };
   switch (command) {
@@ -2674,7 +3199,8 @@ async function main(argv) {
       if (rest.length < 1 || rest.length > 2) throw usage('model takes a client and an optional model id; see genesis --help');
       await model(await requireSession(flags), clientById(rest[0]), rest[1], flags);
       return;
-    case 'usage': expect(0); await showUsage(await requireSession(flags), flags); return;
+    case 'usage': case 'stats': case 'billing': case 'pricing': case 'limits': expect(0); await account(command, flags); return;
+    case 'console': expect(0); out(await consoleLink(await requireSession(flags))); return;
     case 'capacity': expect(0); await showCapacity(await requireSession(flags)); return;
     case 'connections':
       if (rest.length === 0 || (rest.length === 1 && rest[0] === 'list')) await showConnections(await requireSession(flags));
