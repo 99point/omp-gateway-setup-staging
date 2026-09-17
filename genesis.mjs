@@ -1913,6 +1913,88 @@ async function consoleLink(session) {
   if (url.origin !== new URL(session.endpoint).origin || url.pathname !== '/admin/') throw new CliError('the console link has an unexpected origin or path');
   return payload.url;
 }
+// The integration guide for this account's gateway: generic wiring steps a
+// developer or an agent can paste, with the endpoint and served models filled
+// in from the live catalog. Never includes a key.
+const CLIPBOARD_TOOLS = [['pbcopy', []], ['wl-copy', []], ['xclip', ['-selection', 'clipboard']], ['xsel', ['--clipboard', '--input']]];
+async function connectGuide(session) {
+  const endpoint = new URL(session.endpoint).origin;
+  let served = { anthropic: [], 'openai-codex': [] };
+  try {
+    const catalog = await api(session, 'GET', '/v1/models');
+    if (record(catalog) && Array.isArray(catalog.data)) {
+      for (const card of catalog.data) {
+        if (!record(card) || typeof card.id !== 'string' || !(card.owned_by in served)) continue;
+        served[card.owned_by].push(rawModelId(card.id));
+      }
+    }
+  } catch { served = null; }
+  const models = served === null ? '(catalog unavailable; GET /v1/models lists them)'
+    : `anthropic: ${served.anthropic.join(', ') || 'none'}\n  openai-codex: ${served['openai-codex'].join(', ') || 'none'}`;
+  return `# Genesis API · ${endpoint}
+Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'internal'}
+
+## 1. Keys
+- Personal key (s99dev.…): issued by the Genesis owner. Keep it on your server; it reads the catalog and your bill and mints child keys. Never ship it to browsers or workers.
+- Child key for product workers (needs Server access on the personal key):
+    curl -sS -X POST ${endpoint}/v1/leases -H "Authorization: Bearer $GENESIS_KEY" -H "Content-Type: application/json" -d '{"ttlSeconds":3600}'
+    → {"token":"…","leaseId":"…","expiresAt":"…"}   (ttlSeconds 1–43200; default 3600)
+  A child can read the catalog and call models, nothing else. Revoke one early:
+    curl -sS -X POST ${endpoint}/v1/leases/revoke -H "Authorization: Bearer $GENESIS_KEY" -H "Content-Type: application/json" -d '{"leaseId":"…"}'
+
+## 2. Endpoints (Bearer: personal key or child token)
+  GET  /v1/models                    served models
+  POST /v1/chat/completions          OpenAI Chat Completions; the model id selects the provider
+  POST /v1/responses                 OpenAI Responses
+  POST /v1/messages                  Anthropic Messages (also /v1/messages/count_tokens)
+  GET  /v1/billing?period=month|all|YYYY-MM[&thread_id=ID]   your statement (personal key only)
+
+## 3. SDK setup
+  OpenAI SDK:    base_url = ${endpoint}/v1   api_key = <token>   → client.chat.completions.create(...) or client.responses.create(...)
+  Anthropic SDK: base_url = ${endpoint}      auth_token = <token> (api_key unset) → client.messages.create(...)
+  curl:
+    curl -sS ${endpoint}/v1/chat/completions -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+      -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Say OK"}],"max_tokens":32}'
+
+## 4. Conversation state
+  Send the full message history on every call; Genesis stores no threads. Optional header
+  X-Genesis-Thread-Id: <your-id> groups one conversation's charges; read them with GET /v1/billing?period=month&thread_id=<your-id>.
+
+## 5. Refusals
+  402 genesis_budget_exceeded  monthly or per-model limit reached; raise it with \`genesis limits\` or the console (\`genesis console\`), then retry
+  429 genesis_budget_pending   running calls hold the remaining budget; retry shortly
+  400 model is not served      use an id from GET /v1/models
+  401 / 403                    expired, rotated or revoked key or child; mint a new child
+  Headers on every refusal: X-Should-Retry (true|false) and X-S99-Execution (none = no model call happened; unknown = do not replay automatically).
+
+## 6. Chat Completions notes
+  n=1 only · stop only on claude-* · response_format only on gpt-* · images as https or data: URLs · max_tokens defaults to 4096 on claude-*
+  Usage is metered per token at the current Genesis rate; the statement shows the API-equivalent price, your charge and the discount.
+
+## Served models
+  ${models}
+`;
+}
+async function copyToClipboard(text) {
+  for (const [command, args] of CLIPBOARD_TOOLS) {
+    const child = spawnWork(command, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    const outcome = new Promise(resolve => { child.once('error', () => resolve(false)); child.once('close', code => resolve(code === 0)); });
+    child.stdin.on('error', () => {});
+    child.stdin.end(text);
+    if (await outcome) return command;
+  }
+  return null;
+}
+async function connect(session, flags) {
+  const guide = await connectGuide(session);
+  if (flags.copy) {
+    const tool = await copyToClipboard(guide);
+    if (tool !== null) { done('Copied', `the connection guide (${tool})`); return; }
+    out(guide);
+    throw new CliError('no clipboard tool found (pbcopy, wl-copy, xclip or xsel); printed instead');
+  }
+  out(guide);
+}
 async function showCapacity(session) {
   out(renderCapacity(await api(session, 'GET', '/admin/api/cli/capacity')));
 }
@@ -2876,6 +2958,11 @@ async function dashboard(flags, entry = null) {
           showResult(view, `Console ${glyph.dot} ${session.name}`);
           continue;
         }
+        if (view.route === 'connect') {
+          view.body = await runProgress(view, 'Connect', () => connectGuide(session));
+          showResult(view, `Connect ${glyph.dot} ${session.name}`);
+          continue;
+        }
         if (view.route === 'limitEdit') {
           if (environment !== 'prod') await authorizeSecondary(view);
           const model = view.modelId;
@@ -2942,6 +3029,7 @@ async function dashboard(flags, entry = null) {
                   { value: 'clients', label: 'Clients' },
                   { value: 'usage', label: 'Usage', hint: accountTabs(session).map(tab => tab.label.toLowerCase()).join(` ${glyph.dot} `) },
                   { value: 'console', label: 'Console' },
+                  { value: 'connect', label: 'Connect', hint: 'API guide for your product; genesis connect --copy' },
                   ...(session.role === 'owner' || session.role === 'admin' && session.identityClass === 'internal'
                     ? [{ value: 'capacity', label: 'Capacity' }, { value: 'connections', label: 'Connections' }] : []),
                   { value: 'smoke', label: 'Smoke', hint: ['health', 'login', 'models', 'one real call per provider'].join(` ${glyph.dot} `) },
@@ -3125,6 +3213,7 @@ const HELP = `Usage: genesis [command] [options]
   pricing [--json]                          current model prices and discounts
   limits [--json] [--monthly USD|unlimited] [--model ID --limit USD|none]
   console                                   one-time browser login link
+  connect [--copy]                          API integration guide for this gateway (endpoints, keys, SDK setup); --copy puts it on the clipboard
   capacity                                  owner/admin
   connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
   smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
@@ -3136,7 +3225,7 @@ Environment override: --environment prod | staging (does not change the saved se
 Clients: ${CLIENTS.map(client => client.id).join(', ')}
 Exit codes: 0 ok, 1 failure, 2 usage`;
 const VALUE_FLAGS = new Set(['environment', 'url', 'model', 'profile', 'provider', 'worker', 'port', 'period', 'monthly', 'limit']);
-const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json']);
+const SWITCH_FLAGS = new Set(['overwrite', 'yes', 'version', 'help', 'update', 'json', 'copy']);
 export function parseArgs(argv) {
   const positionals = [];
   const flags = {};
@@ -3201,6 +3290,7 @@ async function main(argv) {
       return;
     case 'usage': case 'stats': case 'billing': case 'pricing': case 'limits': expect(0); await account(command, flags); return;
     case 'console': expect(0); out(await consoleLink(await requireSession(flags))); return;
+    case 'connect': expect(0); await connect(await requireSession(flags), flags); return;
     case 'capacity': expect(0); await showCapacity(await requireSession(flags)); return;
     case 'connections':
       if (rest.length === 0 || (rest.length === 1 && rest[0] === 'list')) await showConnections(await requireSession(flags));
