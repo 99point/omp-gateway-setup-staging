@@ -2154,7 +2154,9 @@ async function smoke(session, flags, view = null) {
       }
       return checks.at(-1);
     };
-    await add('health', () => request(session.endpoint, null, 'GET', '/healthz'), smokeHealth);
+    // With the key: an operator's health carries topology and admission
+    // detail; a customer's names readiness only (`workers —`).
+    await add('health', () => request(session.endpoint, session.token, 'GET', '/healthz'), smokeHealth);
     await add('login', () => api(session, 'GET', '/admin/api/cli/me'), value => {
       const identity = validateMe(value);
       return `${identity.name} ${glyph.dot} ${identity.role} ${glyph.dot} ${identity.identityClass ?? 'unclassified'}`;
