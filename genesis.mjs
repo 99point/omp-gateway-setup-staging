@@ -1931,12 +1931,13 @@ async function connectGuide(session) {
   } catch { served = null; }
   const models = served === null ? '(catalog unavailable; GET /v1/models lists them)'
     : `anthropic: ${served.anthropic.join(', ') || 'none'}\n  openai-codex: ${served['openai-codex'].join(', ') || 'none'}`;
+  const example = served?.anthropic[0] ?? served?.['openai-codex'][0] ?? 'claude-haiku-4-5';
   return `# Genesis API · ${endpoint}
 Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'internal'}
 
 ## 1. Keys
-- Personal key (s99dev.…): issued by the Genesis owner. Keep it on your server; it reads the catalog and your bill and mints child keys. Never ship it to browsers or workers.
-- Child key for product workers (needs Server access on the personal key):
+- Personal key (s99dev.…): issued by the Genesis owner. Keep it on your server; it reads the catalog and, with Server access enabled by the owner, your bill and child keys. Never ship it to browsers or workers.
+- Child key for product workers (Server access required):
     curl -sS -X POST ${endpoint}/v1/leases -H "Authorization: Bearer $GENESIS_KEY" -H "Content-Type: application/json" -d '{"ttlSeconds":3600}'
     → {"token":"…","leaseId":"…","expiresAt":"…"}   (ttlSeconds 1–43200; default 3600)
   A child can read the catalog and call models, nothing else. Revoke one early:
@@ -1947,14 +1948,14 @@ Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'inter
   POST /v1/chat/completions          OpenAI Chat Completions; the model id selects the provider
   POST /v1/responses                 OpenAI Responses
   POST /v1/messages                  Anthropic Messages (also /v1/messages/count_tokens)
-  GET  /v1/billing?period=month|all|YYYY-MM[&thread_id=ID]   your statement (personal key only)
+  GET  /v1/billing?period=month|all|YYYY-MM[&thread_id=ID]   your statement (personal key with Server access; \`genesis usage\` works for any key)
 
 ## 3. SDK setup
   OpenAI SDK:    base_url = ${endpoint}/v1   api_key = <token>   → client.chat.completions.create(...) or client.responses.create(...)
   Anthropic SDK: base_url = ${endpoint}      auth_token = <token> (api_key unset) → client.messages.create(...)
   curl:
     curl -sS ${endpoint}/v1/chat/completions -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-      -d '{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"Say OK"}],"max_tokens":32}'
+      -d '{"model":"${example}","messages":[{"role":"user","content":"Say OK"}],"max_tokens":32}'
 
 ## 4. Conversation state
   Send the full message history on every call; Genesis stores no threads. Optional header
@@ -1964,11 +1965,15 @@ Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'inter
   402 genesis_budget_exceeded  monthly or per-model limit reached; raise it with \`genesis limits\` or the console (\`genesis console\`), then retry
   429 genesis_budget_pending   running calls hold the remaining budget; retry shortly
   400 model is not served      use an id from GET /v1/models
+  400 unsupported parameter    only the parameters listed below are accepted; the message names the offending one
   401 / 403                    expired, rotated or revoked key or child; mint a new child
-  Headers on every refusal: X-Should-Retry (true|false) and X-S99-Execution (none = no model call happened; unknown = do not replay automatically).
+  Model-route refusals carry X-Should-Retry (true|false) and X-S99-Execution (none = no model call happened; unknown = do not replay automatically).
 
 ## 6. Chat Completions notes
-  n=1 only · stop only on claude-* · response_format only on gpt-* · images as https or data: URLs · max_tokens defaults to 4096 on claude-*
+  Accepted: model, messages, stream, stream_options, tools, tool_choice, parallel_tool_calls, max_tokens/max_completion_tokens, temperature, top_p, stop, response_format, reasoning_effort, user, metadata, n=1.
+  Dropped where the provider cannot take them: max_tokens, temperature, top_p, user, metadata on gpt-* (the Codex backend sets its own output ceiling and sampling); reasoning_effort, metadata on claude-*.
+  Refused where they would change the output contract: stop on gpt-*, response_format on claude-*.
+  Images as https or data: URLs · max_tokens defaults to 4096 on claude-* · the adapter serves 4 completions at once per edge, 2 per token (503 busy: retry shortly)
   Usage is metered per token at the current Genesis rate; the statement shows the API-equivalent price, your charge and the discount.
 
 ## Served models
@@ -1991,7 +1996,7 @@ async function connect(session, flags) {
     const tool = await copyToClipboard(guide);
     if (tool !== null) { done('Copied', `the connection guide (${tool})`); return; }
     out(guide);
-    throw new CliError('no clipboard tool found (pbcopy, wl-copy, xclip or xsel); printed instead');
+    throw new CliError('no usable clipboard tool (pbcopy, wl-copy, xclip or xsel; a display may be required); printed instead');
   }
   out(guide);
 }
