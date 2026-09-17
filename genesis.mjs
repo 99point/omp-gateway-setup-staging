@@ -1973,7 +1973,7 @@ Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'inter
   Accepted: model, messages, stream, stream_options, tools, tool_choice, parallel_tool_calls, max_tokens/max_completion_tokens, temperature, top_p, stop, response_format, reasoning_effort, user, metadata, n=1.
   Dropped where the provider cannot take them: max_tokens, temperature, top_p, user, metadata on gpt-* (the Codex backend sets its own output ceiling and sampling); reasoning_effort, metadata on claude-*.
   Refused where they would change the output contract: stop on gpt-*, response_format on claude-*.
-  Images as https or data: URLs · max_tokens defaults to 4096 on claude-* · the adapter serves 4 completions at once per edge, 2 per token (503 busy: retry shortly)
+  Images as https or data: URLs · max_tokens defaults to 4096 on claude-* · the adapter serves 24 completions at once per edge, 12 per token (503 busy: retry shortly)
   Usage is metered per token at the current Genesis rate; the statement shows the API-equivalent price, your charge and the discount.
 
 ## Served models
