@@ -207,7 +207,8 @@ OPENCODE_CONFIG (explicit file), XDG_CONFIG_HOME, or PI_CODING_AGENT_DIR.
 Disable/enable/unset need no endpoint or new key and never contact the gateway.
 Only configure requires the selected client (OMP also resolves switch scopes).
 All actions need Node.js >=18. Native configure additionally needs Python >=3.10;
-Claude/Codex/OpenCode configure need Python jsonschema >=4.18.
+Claude/Codex/OpenCode configure need Python jsonschema >=4.18. Every python3 on
+PATH is tried in order, or AGENT_AUTH_PYTHON_BIN names the interpreter.
 OMP and Codex use checksum-pinned yq v4.53.6 (cached/local for switching).
 No client or OAuth login is installed or removed.
 EOF
@@ -566,11 +567,40 @@ require_switch_tools() {
 require_native_tools() {
   validation_home="${scratch_dir}/client-home"
   require_switch_tools
-  python_bin="$(require_executable python3)"
-  "${python_bin}" -c 'import sys; assert sys.version_info >= (3, 10)' || fail 'Python >=3.10 is required'
+  python_bin="$(resolve_python)"
+  ui_done 'Python' "${python_bin}"
+}
+# Python >=3.10 runs the client probes; Claude/Codex/OpenCode schema validation
+# also imports jsonschema >=4.18. The first python3 on PATH is often a bare
+# distribution build (Homebrew, /usr/bin) while jsonschema lives in another
+# interpreter (conda, pyenv, a venv), so every python3 on PATH is tried in
+# order; AGENT_AUTH_PYTHON_BIN names one explicitly.
+python_qualifies() {
+  "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1 || return 1
+  [[ "${harness}" != pi ]] || return 0
+  "$1" -c 'from jsonschema import Draft7Validator; from referencing import Registry' >/dev/null 2>&1
+}
+resolve_python() {
+  local need='Python >=3.10' remedy='set AGENT_AUTH_PYTHON_BIN to a python3 >=3.10' candidate tried='' seen=''
   if [[ "${harness}" != pi ]]; then
-    "${python_bin}" -c 'from jsonschema import Draft7Validator; from referencing import Registry' >/dev/null 2>&1 || fail 'Python jsonschema >=4.18 is required (install it in your Python environment first)'
+    need='Python >=3.10 with jsonschema >=4.18'
+    remedy="install jsonschema into one of them (python3 -m pip install 'jsonschema>=4.18') or set AGENT_AUTH_PYTHON_BIN to a python3 that has it"
   fi
+  if [[ -n "${AGENT_AUTH_PYTHON_BIN:-}" ]]; then
+    [[ "${AGENT_AUTH_PYTHON_BIN}" == /* && -x "${AGENT_AUTH_PYTHON_BIN}" ]] || fail "AGENT_AUTH_PYTHON_BIN must be an absolute executable path: ${AGENT_AUTH_PYTHON_BIN}"
+    python_qualifies "${AGENT_AUTH_PYTHON_BIN}" || fail "${need} is required; AGENT_AUTH_PYTHON_BIN does not qualify: ${AGENT_AUTH_PYTHON_BIN}"
+    printf '%s\n' "${AGENT_AUTH_PYTHON_BIN}"
+    return
+  fi
+  while IFS= read -r candidate; do
+    [[ "${candidate}" == /* && -x "${candidate}" ]] || continue
+    [[ $'\n'"${seen}"$'\n' != *$'\n'"${candidate}"$'\n'* ]] || continue
+    seen="${seen}${candidate}"$'\n'
+    if python_qualifies "${candidate}"; then printf '%s\n' "${candidate}"; return; fi
+    tried="${tried:+${tried}, }${candidate}"
+  done < <(type -aP python3 2>/dev/null || true)
+  [[ -n "${tried}" ]] || fail "${need} is required; no python3 is on PATH (or set AGENT_AUTH_PYTHON_BIN)"
+  fail "${need} is required; no python3 on PATH qualifies (tried ${tried}); ${remedy}"
 }
 sha256_file() {
   local file="$1" output

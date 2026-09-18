@@ -1203,7 +1203,7 @@ function setupNextStep(cause, client) {
   if (/^model ids are 1-256 printable ASCII characters/.test(cause)) return 'run genesis update, then retry';
   if (/^could not reach /.test(cause)) return 'check the gateway URL and your network, then retry';
   if (/^model .* is not served by this gateway/.test(cause)) return `pick a served model: genesis model ${client.id}`;
-  if (/^(Node\.js|Python|curl|env) .*is required|^Python jsonschema|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
+  if (/^(Node\.js|Python|curl|env) .*is required|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
   if (/^no OMP protocol works/.test(cause)) return 'update OMP, then retry';
   return null;
 }
