@@ -1020,6 +1020,8 @@ async function resolveScope(client, profile) {
     return { stateFile: path.join(tokenDir, 'switch.json'), targets: [path.join(agentDir, 'models.yml'), path.join(agentDir, 'config.yml'), path.join(tokenDir, 'token')] };
   }
   if (client.id === 'claude-code') {
+    // Claude's first-run record (adapters/claude-code.sh seeds one field into it)
+    // is the client's own file, never one consent covers.
     const directory = homeDir('CLAUDE_CONFIG_DIR', '.claude');
     return { stateFile: path.join(directory, 'agent-auth/switch.json'), targets: [path.join(directory, 'settings.json'), path.join(directory, 'agent-auth/token')] };
   }
@@ -1205,6 +1207,7 @@ function setupNextStep(cause, client) {
   if (/^model .* is not served by this gateway/.test(cause)) return `pick a served model: genesis model ${client.id}`;
   if (/^(Node\.js|Python|curl|env) .*is required|is required to verify/.test(cause)) return 'install the named prerequisite, then retry';
   if (/^no OMP protocol works/.test(cause)) return 'update OMP, then retry';
+  if (/^direct credential env .* would outrank the gateway/.test(cause)) return `remove that setting, or run genesis configure ${client.id} --overwrite so the gateway owns it`;
   return null;
 }
 async function runSetup(session, client, action, args, withToken) {
@@ -1223,7 +1226,13 @@ async function runSetup(session, client, action, args, withToken) {
   if (verbose()) { relay(child.stdout, process.stdout); relay(child.stderr, process.stderr); }
   const [code, signal] = await once(child, 'close');
   log.close();
-  if (code === 0) return;
+  if (code === 0) {
+    // What the installer told the user under the client's own label (a
+    // replaced model, a direct credential taken over: setup/native/*.cjs)
+    // belongs in the summary; a verbose run relayed it already.
+    if (!verbose()) for (const line of log.lines) if (line.startsWith(`${client.label}: `)) warn(line);
+    return;
+  }
   if (signal === 'SIGINT' || code === 130) throw new Interrupt();
   const cause = setupCause(log.lines, code, signal);
   const next = setupNextStep(cause, client);
@@ -1268,6 +1277,8 @@ function checkProfile(client, profile) {
 }
 // Consent before --overwrite: OMP always (its scope lookup may initialize client
 // state); other clients only when the scope already holds a config or key.
+// Claude's user settings may also hold a direct Anthropic credential or cloud
+// route, which configure takes over (setup/native/claude-code.cjs).
 async function consentToOverwrite(client, profile, flags) {
   if (flags.overwrite) return true;
   let occupied = client.id === 'omp';
@@ -1275,13 +1286,14 @@ async function consentToOverwrite(client, profile, flags) {
     try { const scope = await resolveScope(client, profile); occupied = [scope.stateFile, ...scope.targets].some(exists); } catch { occupied = true; }
   }
   if (!occupied) return false;
+  const replaced = client.id === 'claude-code' ? 'gateway settings, key and any direct Anthropic credential or cloud route' : 'gateway settings and key';
   if (!interactive()) {
     throw usage(client.id === 'omp' ? 'OMP setup needs --overwrite without a terminal (its scope lookup may initialize client state)'
-      : `${client.label} is already set up here; add --overwrite to replace its gateway settings and key`);
+      : `${client.label} is already set up here; add --overwrite to replace its ${replaced}`);
   }
   const question = client.id === 'omp'
     ? 'Set up OMP here? Existing gateway settings and key in this scope are replaced; OMP may initialize its state'
-    : `Replace the ${client.label} gateway settings and key in this scope? Unrelated settings stay intact`;
+    : `Replace the ${client.label} ${replaced} in this scope? Other settings stay intact`;
   if (await confirm(question)) return true;
   out(`Left ${client.label} alone; no user files changed.`);
   return null;

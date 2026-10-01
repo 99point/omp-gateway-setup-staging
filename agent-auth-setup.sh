@@ -347,17 +347,20 @@ init_transaction() {
   trap 'exit 143' TERM HUP
 }
 confirm_existing_setup() {
-  local target
+  local target replaced='the gateway settings and key'
   local existing=()
+  # Claude's user settings may also hold a direct Anthropic credential or cloud
+  # route, which configure takes over (claude-code.cjs); consent names it.
+  if [[ "${harness}" == claude-code ]]; then replaced='the gateway settings, key and any direct Anthropic credential or cloud route'; fi
   for target in "${setup_targets[@]}"; do
     if [[ -e "${target}" || -L "${target}" ]]; then existing+=("${target}"); fi
   done
   (( ${#existing[@]} > 0 )) || return 0
   (( overwrite == 0 )) || return 0
-  (( has_tty == 1 )) || fail 'selected-client configuration or key already exists; rerun with --overwrite to consent, or leave it alone'
+  (( has_tty == 1 )) || fail "selected-client configuration or key already exists; rerun with --overwrite to replace ${replaced}, or leave it alone"
   printf 'Existing %s configuration/key files:\n' "${harness}" >/dev/tty
   for target in "${existing[@]}"; do printf '  %s\n' "${target/#${HOME}/\~}" >/dev/tty; done
-  if ui_confirm 'Replace the gateway settings and key in this scope? Unrelated settings stay intact' no; then
+  if ui_confirm "Replace ${replaced} in this scope? Other settings stay intact" no; then
     overwrite=1
     return 0
   fi
@@ -397,7 +400,9 @@ register_file() {
     [[ "${tx_paths[index]}" != "${target}" ]] || fail "duplicate transaction target: ${target}"
   done
   [[ ! -L "${target}" && ( ! -e "${target}" || -f "${target}" ) ]] || fail "unsafe transaction target: ${target}"
-  [[ ! -e "${target}" || "${overwrite}" == 1 ]] || fail "configuration appeared during setup; rerun with --overwrite to consent: ${target}"
+  # A seed adds one field to the client's own state file; it is never a file
+  # overwrite consents to, and its bytes are still checked again at commit.
+  [[ ! -e "${target}" || "${overwrite}" == 1 || "${kind}" == seed ]] || fail "configuration appeared during setup; rerun with --overwrite to consent: ${target}"
   mkdir -p "$(dirname "${target}")"
   original="${scratch_dir}/original-${tx_count}"
   if [[ -f "${target}" ]]; then cp -p "${target}" "${original}"; else original=''; fi
@@ -437,8 +442,8 @@ commit_transaction() {
   # Switch state is written first and deleted last: after an abrupt stop the
   # files that did land are always described by it, so a later switch or
   # configure can finish or undo them. Tokens still precede the configs that
-  # reference them.
-  for pass in state token asset config cleanup state-delete; do
+  # reference them; a client's seeded state file follows the configs.
+  for pass in state token asset config seed cleanup state-delete; do
     for ((index=0; index<tx_count; index++)); do
       case "${pass}" in
         state) [[ "${tx_kinds[index]}" == state && "${tx_operations[index]}" != delete ]] || continue ;;
@@ -909,7 +914,9 @@ probe_provider_wire_route() {
 # named) before any provider is contacted; 404 = the provider's API is not served.
 probe_standard_route() {
   local provider="$1" path probe_status
-  if [[ "${provider}" == anthropic ]]; then path='/anthropic/v1/messages'; else path="/${provider}/v1/responses"; fi
+  if [[ "${provider}" == anthropic ]]; then path='/anthropic/v1/messages'
+  elif [[ "${harness}" == opencode ]]; then path='/v1/chat/completions'
+  else path="/${provider}/v1/responses"; fi
   probe_status="$(gateway_request "${gateway_url}${path}" "${scratch_dir}/probe-response" \
     --request POST --header 'Content-Type: application/json' --data-binary "@${scratch_dir}/probe.json")" || exit 1
   case "${probe_status}" in
@@ -942,10 +949,10 @@ validate_gateway() {
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" providers "${harness}" "${catalog_file}" > "${scratch_dir}/native-providers"
     while IFS= read -r provider; do
       if ! gateway_catalog "/${provider}/v1/models" "${scratch_dir}/${provider}-catalog.json" 1; then
-        fail "${gateway_url} has no native ${provider} route (/${provider}/v1/models is HTTP 404); ${harness} needs a gateway that serves the provider's own API"
+        fail "${gateway_url} has no ${provider} model catalog (/${provider}/v1/models is HTTP 404); this catalog is required to validate model metadata"
       fi
       probe_standard_route "${provider}"
-      [[ "${probe_result}" == present ]] || fail "${gateway_url} serves the ${provider} catalog but not its model route; ${harness} needs a gateway that serves the provider's own API"
+      [[ "${probe_result}" == present ]] || fail "${gateway_url} serves the ${provider} catalog but not the selected client's model route"
     done < "${scratch_dir}/native-providers"
     "${node_bin}" "${scratch_dir}/native/catalog.cjs" normalize "${harness}" "${catalog_file}" "${scratch_dir}" > "${scratch_dir}/native-catalog.json"
   else
@@ -993,11 +1000,11 @@ native_client() {
 # Snapshot before parsing/merging. All adapter edits use this immutable source,
 # never a live file that might change between parsing and transaction admission.
 stage_config() {
-  local target="$1" format="${2:-json}" role="${3:-config}" empty
+  local target="$1" format="${2:-json}" role="${3:-config}" kind="${4:-config}" empty
   empty="${scratch_dir}/empty-${format}"
   if [[ "${format}" == toml ]]; then printf '' > "${empty}"; else printf '{}\n' > "${empty}"; fi
-  if [[ -f "${target}" ]]; then register_file "${target}" "${target}" config
-  else register_file "${target}" "${empty}" config; fi
+  if [[ -f "${target}" ]]; then register_file "${target}" "${target}" "${kind}"
+  else register_file "${target}" "${empty}" "${kind}"; fi
   tx_formats[tx_count-1]="${format}"
   tx_roles[tx_count-1]="${role}"
   staged_config="${tx_candidates[tx_count-1]}"
@@ -1018,7 +1025,11 @@ native_report() {
   printf 'Undo: rerun this setup and choose Disable (keeps the key), or Unset (removes it).\n'
   case "${harness}" in
     claude-code)
-      printf 'Run: CLAUDE_CONFIG_DIR=%s claude\n' "$(quote_shell_word "${client_dir}")"
+      if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+        printf 'Run: CLAUDE_CONFIG_DIR=%s claude\n' "$(quote_shell_word "${client_dir}")"
+      else
+        printf 'Run: claude\n'
+      fi
       printf 'Managed/project settings and an apps-gateway session can override this user scope.\n' ;;
     codex)
       printf 'Run: CODEX_HOME=%s codex' "$(quote_shell_word "${client_dir}")"
@@ -1026,8 +1037,8 @@ native_report() {
       printf '\nTrusted project and managed settings can override this scope.\n' ;;
     opencode)
       printf 'Run: OPENCODE_CONFIG=%s opencode\n' "$(quote_shell_word "${config_display}")"
-      printf 'OpenCode has no supported session-retry disable; its Codex requests can include max_output_tokens.\n'
-      printf 'Generic Anthropic OAuth shaping and Codex endpoint acceptance require independent wire proof.\n' ;;
+      printf 'OpenCode uses the Chat Completions API for Codex; session retries remain client-controlled.\n'
+      printf 'Anthropic compatibility requires a real reply with the client native prompt.\n' ;;
     pi)
       printf 'Run: PI_CODING_AGENT_DIR=%s pi\n' "$(quote_shell_word "${client_dir}")"
       printf 'Pi uses generic Responses, not the JWT-only Codex API. Extra caller sampling controls are not removed.\n'
@@ -1717,11 +1728,19 @@ omp_report() {
 # --- setup/adapters/claude-code.sh ---
 claude_code_prepare() {
   native_prepare claude
-  local key value
-  for key in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AWS_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS; do
+  local key value record_state
+  # A credential or cloud route exported in this environment outranks the
+  # gateway helper in Claude's own credential order (claude-code.cjs), so the
+  # actions that route through the gateway refuse it; disable and unset move
+  # away from the gateway and stay usable.
+  for key in ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AWS_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS; do
     value="${!key:-}"
-    [[ "${action}" != configure || -z "${value}" || "${value}" == 0 || "${value}" == false ]] || fail 'inherited Claude credentials/cloud routing conflict with setup; use a clean environment and isolated CLAUDE_CONFIG_DIR'
+    [[ "${action}" == disable || "${action}" == unset || -z "${value}" || "${value}" == 0 || "${value}" == false ]] || fail 'inherited Claude credentials/cloud routing conflict with setup; use a clean environment and isolated CLAUDE_CONFIG_DIR'
   done
+  # A custom OAuth deployment keeps its own first-run record
+  # (.claude-custom-oauth.json, Claude 2.1.275/2.1.286); configure refuses it
+  # rather than seeding the record of the public deployment.
+  [[ "${action}" != configure || -z "${CLAUDE_CODE_CUSTOM_OAUTH_URL:-}" ]] || fail 'CLAUDE_CODE_CUSTOM_OAUTH_URL selects a separate Claude first-run record; unset it before configuring the gateway'
   client_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
   config_target="$(resolve_config_target "${client_dir}/settings.json")"
   token_dir="$(resolve_token_directory "${client_dir}/agent-auth")"
@@ -1730,14 +1749,32 @@ claude_code_prepare() {
   switch_configs=("${config_target}"); switch_formats=(json); switch_roles=(config)
   switch_references=("${client_dir}/settings.json")
   switch_assets=()
+  # Claude's first-run record is its global config: the legacy
+  # <config-dir>/.config.json when that exists, else
+  # ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json. Configure adds hasCompletedOnboarding
+  # to a pending record (Claude's own file, so never a file overwrite consent
+  # covers: register_file admits the seed kind, the switch plan writes it
+  # without a backup); a completed record is never touched.
+  onboarding_target=''
+  if [[ "${action}" == configure ]]; then
+    if [[ -f "${client_dir}/.config.json" ]]; then onboarding_target="${client_dir}/.config.json"
+    else onboarding_target="${CLAUDE_CONFIG_DIR:-${HOME}}/.claude.json"; fi
+    onboarding_target="$(resolve_config_target "${onboarding_target}")"
+    record_state="$("${node_bin}" "${scratch_dir}/native/claude-code.cjs" onboarding-state "${onboarding_target}")"
+    if [[ "${record_state}" == complete ]]; then onboarding_target=''; fi
+  fi
 }
 claude_code_stage() {
   stage_config "${config_target}"
-  "${node_bin}" "${scratch_dir}/native/claude-code.cjs" "${source_config}" "${staged_config}" \
+  "${node_bin}" "${scratch_dir}/native/claude-code.cjs" settings "${source_config}" "${staged_config}" \
     "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}"
   native_schema "${staged_config}" strict
   # Claude has no supported offline config-validation command. Its exact staged
   # JSON is validated against the bundled schema; help or -p would not prove it.
+  if [[ -n "${onboarding_target}" ]]; then
+    stage_config "${onboarding_target}" json onboarding seed
+    "${node_bin}" "${scratch_dir}/native/claude-code.cjs" onboarding "${source_config}" "${staged_config}"
+  fi
 }
 
 # --- setup/adapters/codex.sh ---
@@ -2048,6 +2085,9 @@ try {
         const value = config.provider[key];
         return [key, {
           npm: value.npm,
+          // debug config redacts credentials. The same file reference in this
+          // non-secret name proves expansion without depending on secret output.
+          name: `{file:${dummyToken}}`,
           options: { baseURL: value.options.baseURL, apiKey: `{file:${dummyToken}}` },
           models: Object.fromEntries(Object.entries(value.models).map(([id, model]) => [id, {
             name: model.name, reasoning: model.reasoning, limit: model.limit, modalities: model.modalities, cost: model.cost,
@@ -2062,7 +2102,8 @@ try {
     if (actual.model !== expected.model || actual.small_model !== expected.small_model) throw new Error('OpenCode did not select the staged gateway models');
     for (const [id, provider] of Object.entries(expected.provider)) {
       if (actual.provider?.[id]?.options?.baseURL !== provider.options.baseURL ||
-          actual.provider?.[id]?.options?.apiKey !== 'agent-auth-schema-probe') throw new Error('OpenCode did not adopt the file-backed gateway provider');
+          actual.provider?.[id]?.npm !== provider.npm ||
+          actual.provider?.[id]?.name !== 'agent-auth-schema-probe') throw new Error('OpenCode did not adopt the file-backed gateway provider');
     }
   } else throw new Error('unknown native validation action');
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
@@ -2072,17 +2113,21 @@ AGENT_AUTH_9F39659DDFD5722A6E76
 const fs = require('node:fs');
 const { load, patch, command } = require('./config-io.cjs');
 const { select, newestHaiku } = require('./catalog.cjs');
-try {
-  const [source, destination, catalogFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
+// A direct credential or cloud route inside the user settings outranks the
+// gateway helper in Claude's own credential order (ANTHROPIC_AUTH_TOKEN,
+// CLAUDE_CODE_OAUTH_TOKEN, an approved ANTHROPIC_API_KEY) or bypasses
+// ANTHROPIC_BASE_URL (the cloud flags). Setup owns these paths (switch.cjs
+// lists the same ones): configure drops a live value and the switch state
+// restores it on disable/unset; enable refuses one added while disabled.
+// Inherited process values are refused by the adapter before this runs.
+const conflicts = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AWS_API_KEY',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS'];
+const live = value => value !== undefined && !['', '0', 'false', 0, false].includes(value);
+
+function settings([source, destination, catalogFile, gateway, cat, tokenFile, requested]) {
   const current = load(source, true);
   const normalized = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const catalog = normalized.anthropic;
-  const conflict = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AWS_API_KEY', 'CLAUDE_CODE_USE_BEDROCK',
-    'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS'];
-  for (const key of conflict) {
-    const value = current.env?.[key];
-    if (value && value !== '0' && value !== 'false') throw new Error('existing Claude credentials or cloud routing conflict with gateway setup; choose an isolated CLAUDE_CONFIG_DIR');
-  }
   if (current.forceLoginOrgUUID) throw new Error('Claude organization login policy conflicts with gateway credentials');
   const previousModel = current.model ?? current.env?.ANTHROPIC_MODEL;
   const model = requested ? select('claude-code', normalized, requested).card.id
@@ -2095,7 +2140,10 @@ try {
   const small = catalog.find(card => card.id === previousSmall)?.id ?? haiku?.id ?? model;
   if (previousSmall && previousSmall !== small) console.error(`Claude Code: replacing unsupported background model ${previousSmall} with ${small}.`);
   if (!previousSmall && haiku === undefined) console.error(`Claude Code: no Haiku model is advertised; background requests will use ${model}.`);
+  const dropped = conflicts.filter(key => live(current.env?.[key]));
+  if (dropped.length) console.error(`Claude Code: env ${dropped.join(', ')} would outrank the gateway; removed from the user settings (disable restores it).`);
   patch(source, destination, [
+    ...dropped.map(key => [['env', key], undefined]),
     [['apiKeyHelper'], command(cat, tokenFile)],
     [['model'], model],
     [['env', 'ANTHROPIC_BASE_URL'], `${gateway}/anthropic`],
@@ -2105,6 +2153,29 @@ try {
     [['env', 'CLAUDE_CODE_RETRY_WATCHDOG'], '0'],
     [['env', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK'], '1'],
   ], true);
+}
+// Claude runs its first-run wizard (theme, login method, security notes)
+// until the global config records hasCompletedOnboarding; a completed record
+// leaves it at the trust prompt and the input line. The record is the
+// client's own state file: setup seeds the one field once and never restores
+// or removes it, so a later native /login or logout keeps working.
+function onboardingState([file]) {
+  if (!fs.existsSync(file)) return 'pending';
+  let current;
+  try { current = load(file, true); }
+  catch { throw new Error(`Claude global config is not valid JSON: ${file}; start Claude once to let it repair the file, or fix it by hand`); }
+  return current.hasCompletedOnboarding === true ? 'complete' : 'pending';
+}
+function onboarding([source, destination]) {
+  const value = patch(source, destination, [[['hasCompletedOnboarding'], true]], true);
+  if (value.hasCompletedOnboarding !== true) throw new Error('could not record Claude first-run completion');
+}
+try {
+  const [mode, ...args] = process.argv.slice(2);
+  if (mode === 'settings') settings(args);
+  else if (mode === 'onboarding-state') process.stdout.write(onboardingState(args) + '\n');
+  else if (mode === 'onboarding') onboarding(args);
+  else throw new Error('unknown Claude Code staging mode');
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 AGENT_AUTH_59C29AB800A7942E5E9C
   "${cat_bin}" > "${scratch_dir}/native/codex.cjs" <<'AGENT_AUTH_174B49BDE65749A4F18F'
@@ -2347,10 +2418,12 @@ try {
   const ids = Object.keys(catalog).map(provider => `agent-auth-${provider}`);
   for (const [provider, cards] of Object.entries(catalog)) {
     const id = `agent-auth-${provider}`;
-    const baseURL = `${gateway}/${provider}/v1`;
+    const baseURL = provider === 'anthropic' ? `${gateway}/anthropic/v1` : `${gateway}/v1`;
     const existing = current.provider?.[id];
     if (existing !== undefined && existing.options === undefined) throw new Error('the setup-owned OpenCode provider name is already in use');
-    checkOwnedProvider(existing?.options, baseURL, 'baseURL');
+    // Adopt the prior same-gateway native route, then replace it with chat.
+    const priorURL = `${gateway}/${provider}/v1`;
+    checkOwnedProvider(existing?.options, existing?.options?.baseURL === priorURL ? priorURL : baseURL, 'baseURL');
     const headers = existing?.options?.headers;
     const ownHeader = provider === 'anthropic' && headers && Object.keys(headers).length === 1 &&
       headers.Authorization === `Bearer {file:${tokenFile}}`;
@@ -2364,10 +2437,9 @@ try {
       limit: { context: card.context_length, output: card.max_output_tokens },
       modalities: { input: card.input_modalities, output: ['text'] },
       cost: { input: card.cost.input, output: card.cost.output, cache_read: card.cost.cacheRead, cache_write: card.cost.cacheWrite },
-      ...(provider === 'openai-codex' ? { options: { store: false, instructions: '', include: ['reasoning.encrypted_content'] } } : {}),
     }]));
     changes.push([['provider', id], {
-      npm: provider === 'anthropic' ? '@ai-sdk/anthropic' : '@ai-sdk/openai',
+      npm: provider === 'anthropic' ? '@ai-sdk/anthropic' : '@ai-sdk/openai-compatible',
       name: provider === 'anthropic' ? 'Agent Auth Claude' : 'Agent Auth Codex',
       options: { baseURL, apiKey: `{file:${tokenFile}}`,
         ...(provider === 'anthropic' ? { headers: { Authorization: `Bearer {file:${tokenFile}}` } } : {}) },
@@ -2420,7 +2492,7 @@ function model(card, provider) {
 try {
   const [kind, source, destination, catalogFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
   const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
-  const current = load(source);
+  const current = load(source, kind === 'settings');
   const selected = Object.keys(catalog)[0];
   if (kind === 'models') {
     const changes = [];
@@ -2451,7 +2523,7 @@ try {
       [['defaultProvider'], `agent-auth-${provider}`], [['defaultModel'], selectedModel],
       [['retry', 'enabled'], false], [['retry', 'maxRetries'], 0], [['retry', 'provider', 'maxRetries'], 0],
       [['transport'], 'sse'],
-    ]);
+    ], true);
   } else throw new Error('unknown Pi configuration stage');
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 AGENT_AUTH_78D04398CFC472391FF9
@@ -2563,6 +2635,13 @@ function credentialHeaderPaths(value) {
 const credentialHeaderPath = keys => keys.length >= 4 && keys[0] === 'providers' && providerIds.includes(keys[1]) && credentialHeader(keys.at(-1))
   && (keys.length === 4 && keys[2] === 'headers' || keys.length === 6 && keys[2] === 'modelOverrides' && keys[4] === 'headers');
 const legacyTransport = provider => object(provider) && ['provider-wire', 'pi-native'].includes(provider.transport);
+// Direct credentials and cloud routes that outrank the gateway helper in
+// Claude's own credential order (claude-code.cjs drops a live value on
+// configure; disable and unset restore it). Claude treats '', '0' and 'false'
+// as unset.
+const claudeCredentialKeys = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AWS_API_KEY',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS'];
+const claudeLive = value => value !== undefined && !['', '0', 'false', 0, false].includes(value);
 // Static owned paths plus the credential-header spellings present in VALUES.
 function ownedPaths(harness, role, ...values) {
   switch (harness) {
@@ -2571,7 +2650,7 @@ function ownedPaths(harness, role, ...values) {
       ...values.flatMap(credentialHeaderPaths).filter((keys, index, all) => all.findIndex(other => equal(other, keys)) === index),
     ];
     case 'claude-code': return [['apiKeyHelper'], ['model'], ...['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-      'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_RETRY_WATCHDOG', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK'].map(key => ['env', key])];
+      'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_RETRY_WATCHDOG', 'CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK', ...claudeCredentialKeys].map(key => ['env', key])];
     case 'codex': return [['model'], ['model_provider'], ['model_catalog_json'], ['features', 'enable_request_compression'], ['model_providers', 'agent_auth']];
     case 'opencode': return [['model'], ['small_model'], ['enabled_providers'], ...providerIds.map(id => ['provider', `agent-auth-${id}`])];
     case 'pi': return role === 'models' ? providerIds.map(id => ['providers', `agent-auth-${id}`]) :
@@ -2713,7 +2792,7 @@ function recoverBaseline(file, history, harness, yq, strict, current) {
 }
 function main() {
   const [action, harness, profile, tokenFile, yq, manifest, gatewayUrl = ''] = process.argv.slice(2);
-  const strict = harness === 'claude-code';
+  const strict = file => harness === 'claude-code' || (harness === 'pi' && file.role === 'settings');
   const entries = fs.readFileSync(manifest, 'utf8').replace(/\n$/, '').split('\n').map(line => {
     const [index, target, original, candidate, kind, format, role, restoreSource = ''] = line.split('\t');
     return { index, path: target, original, candidate, kind, format, role, restoreSource };
@@ -2721,12 +2800,15 @@ function main() {
   const stateFile = entries.find(file => file.kind === 'state');
   const files = entries.filter(file => ['config', 'token', 'asset'].includes(file.kind));
   const history = entries.filter(file => file.kind === 'history');
-  const current = new Map(files.filter(file => file.kind === 'config').map(file => [file.path, readConfig(file.original, file.format, yq, strict)]));
+  const current = new Map(files.filter(file => file.kind === 'config').map(file => [file.path, readConfig(file.original, file.format, yq, strict(file))]));
   let state = stateFile.original ? load(stateFile.original, true) : undefined;
   if (state) validateState(state, harness, tokenFile, files);
   const previousState = state;
   const hasGateway = files.some(file => file.kind === 'config' && marked(harness, file.role, current.get(file.path)));
   const operations = new Map(entries.map(file => [file.index, 'keep']));
+  // A seed is a client state file configure writes once (no backup: one field
+  // is added to the client's own record) and no later action switches or removes.
+  for (const file of entries) if (file.kind === 'seed') operations.set(file.index, 'managed');
   if (!state && action !== 'configure' && !hasGateway) {
     if (action === 'enable') throw new Error('no saved gateway configuration in this scope; run --action configure first');
     if (files.some(file => file.kind !== 'config' && file.original)) throw new Error('a private gateway key/catalog exists but no matching switch state or gateway config was found; select the original profile/config path before switching, or preserve and remove the orphaned private files manually');
@@ -2752,10 +2834,10 @@ function main() {
         continue;
       }
       const value = current.get(file.path);
-      const gateway = action === 'configure' ? readConfig(file.candidate, file.format, yq, strict) : value;
+      const gateway = action === 'configure' ? readConfig(file.candidate, file.format, yq, strict(file)) : value;
       const legacy = !state && marked(harness, file.role, value);
-      const baseline = legacy ? recoverBaseline(file, history, harness, yq, strict, value) :
-        file.restoreSource ? readConfig(file.restoreSource, file.format, yq, strict) : value;
+      const baseline = legacy ? recoverBaseline(file, history, harness, yq, strict(file), value) :
+        file.restoreSource ? readConfig(file.restoreSource, file.format, yq, strict(file)) : value;
       const paths = normalizedPaths([...ownedPaths(harness, file.role, value, gateway), ...(previous?.fields.map(field => field.path) ?? [])], baseline);
       const fields = [];
       for (const keys of paths) {
@@ -2793,7 +2875,7 @@ function main() {
       const owner = files.find(file => file.path === backup.role);
       if (!owner) throw new Error('backup does not belong to the selected config scope');
       let value;
-      try { value = readConfig(backup.original, owner.format, yq, strict); } catch { continue; }
+      try { value = readConfig(backup.original, owner.format, yq, strict(owner)); } catch { continue; }
       if (marked(harness, owner.role, value) && !retiredHistory.has(backup.path)) retiredHistory.set(backup.path, { path: backup.path, sha256: digest(backup.original) });
     }
     state = { version: 1, harness, profile, tokenFile, mode: 'enabled', files: records, history: [...retiredHistory.values()] };
@@ -2847,7 +2929,14 @@ function main() {
           changes.push({ path: keys, cell: absent }); put(expected, keys, absent);
         }
       }
-      if (editConfig(file, changes, expected, yq, strict)) operations.set(file.index, 'managed');
+      // A credential the user added while disabled is not a recorded field, so
+      // enabling would leave it beside the gateway route, where Claude prefers
+      // it; enabled must mean the gateway. The edit is the user's: refused, not removed.
+      if (harness === 'claude-code' && desiredMode === 'enabled') {
+        const stray = claudeCredentialKeys.filter(key => claudeLive(expected.env?.[key]));
+        if (stray.length) throw new Error(`direct credential env ${stray.join(', ')} in ${file.path} would outrank the gateway; remove it, or configure again so setup owns it (disable restores it)`);
+      }
+      if (editConfig(file, changes, expected, yq, strict(file))) operations.set(file.index, 'managed');
     }
     if (action === 'unset') {
       for (const old of state.history) {
