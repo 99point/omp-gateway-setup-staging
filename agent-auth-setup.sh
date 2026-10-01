@@ -1821,7 +1821,7 @@ codex_stage() {
   native_client "${validation_home}" "${scratch_dir}/bundled-models.json" "${scratch_dir}/bundled.stderr" debug models --bundled
   "${node_bin}" "${scratch_dir}/native/codex.cjs" "${scratch_dir}/codex-effective.json" "${scratch_dir}/native-catalog.json" \
     "${scratch_dir}/bundled-models.json" "${scratch_dir}/codex-patch.json" "${scratch_dir}/codex-models.json" \
-    "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}"
+    "${catalog_target}" "${gateway_url}" "${cat_bin}" "${token_file}" "${requested_model}" "${config_target}" "${scratch_dir}/codex-source.json"
   PATCH_JSON="${scratch_dir}/codex-patch.json" "${yq_bin}" -p toml -o toml \
     '(. // {}) * load(strenv(PATCH_JSON)) | .model_providers.agent_auth = load(strenv(PATCH_JSON)).model_providers.agent_auth' \
     "${source_config}" > "${config_candidate}" 2> "${scratch_dir}/toml.stderr" || fail 'could not merge Codex gateway settings'
@@ -1875,7 +1875,7 @@ opencode_prepare() {
 opencode_stage() {
   stage_config "${config_target}"
   "${node_bin}" "${scratch_dir}/native/opencode.cjs" "${source_config}" "${staged_config}" \
-    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${token_file}" "${requested_model}"
+    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${token_file}" "${requested_model}" "${config_target}"
   native_schema "${staged_config}"
   mkdir -p "${validation_home}"
   printf 'agent-auth-schema-probe\n' > "${validation_home}/dummy-token"
@@ -1905,7 +1905,7 @@ pi_stage() {
   stage_config "${models_target}" json models
   models_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" models "${source_config}" "${staged_config}" \
-    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}"
+    "${scratch_dir}/native-catalog.json" "${gateway_url}" "${cat_bin}" "${token_file}" '' "${models_target}"
   stage_config "${settings_target}" json settings
   settings_candidate="${staged_config}"
   "${node_bin}" "${scratch_dir}/native/pi.cjs" settings "${source_config}" "${staged_config}" \
@@ -2181,10 +2181,10 @@ AGENT_AUTH_59C29AB800A7942E5E9C
   "${cat_bin}" > "${scratch_dir}/native/codex.cjs" <<'AGENT_AUTH_174B49BDE65749A4F18F'
 'use strict';
 const fs = require('node:fs');
-const { load, save, checkOwnedProvider } = require('./config-io.cjs');
+const { load, save, recordedProvider, checkOwnedProvider } = require('./config-io.cjs');
 const { select } = require('./catalog.cjs');
 try {
-  const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
+  const [configFile, catalogFile, bundledFile, patchFile, modelsFile, finalModelsFile, gateway, cat, tokenFile, requested, configTarget, sourceFile] = process.argv.slice(2);
   const current = load(configFile, true);
   const normalized = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const catalog = normalized['openai-codex'];
@@ -2192,7 +2192,8 @@ try {
   if (!Array.isArray(bundled.models)) throw new Error('Codex did not return its native bundled model catalog');
   const baseUrl = `${gateway}/openai-codex/v1`;
   const previous = current.model_providers?.agent_auth;
-  checkOwnedProvider(previous, baseUrl, 'base_url');
+  checkOwnedProvider(load(sourceFile, true).model_providers?.agent_auth, baseUrl, ['base_url'],
+    recordedProvider(tokenFile, 'codex', configTarget, ['model_providers', 'agent_auth']));
   if (previous?.env_key || previous?.experimental_bearer_token || previous?.http_headers || previous?.env_http_headers) {
     throw new Error('existing Codex gateway provider has conflicting credential/header settings');
   }
@@ -2277,6 +2278,7 @@ AGENT_AUTH_174B49BDE65749A4F18F
   "${cat_bin}" > "${scratch_dir}/native/config-io.cjs" <<'AGENT_AUTH_5C44F65AEEC4D5B50F96'
 'use strict';
 const fs = require('node:fs');
+const path = require('node:path');
 const jsonc = require('../vendor/jsonc-parser/main.js');
 
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
@@ -2330,12 +2332,26 @@ function patch(source, destination, changes, strict = false) {
 function save(path, value) { fs.writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 }); }
 function shellWord(value) { return "'" + value.replaceAll("'", "'\\''") + "'"; }
 function command(cat, tokenFile) { return `${shellWord(cat)} ${shellWord(tokenFile)}`; }
-function checkOwnedProvider(existing, baseUrl, field) {
-  if (existing !== undefined && (!object(existing) || existing[field] !== baseUrl)) {
+function recordedProvider(tokenFile, harness, configFile, keys) {
+  const statePath = path.join(path.dirname(tokenFile), 'switch.json');
+  if (!fs.existsSync(statePath)) return undefined;
+  const state = load(statePath, true);
+  if (state.version !== 1 || state.harness !== harness || state.tokenFile !== tokenFile || !['enabled', 'disabled'].includes(state.mode)) return undefined;
+  const file = Array.isArray(state.files) ? state.files.find(file => file.path === configFile && file.kind === 'config') : undefined;
+  return Array.isArray(file?.fields) ? file.fields.find(field => equal(field.path, keys)) : undefined;
+}
+function checkOwnedProvider(existing, baseUrl, urlPath, recorded) {
+  let url = existing;
+  for (const key of urlPath) url = url?.[key];
+  // A different gateway needs a value recorded for this exact scope, including
+  // either side of an interrupted configure/disable transaction.
+  const owned = recorded && [recorded.before, recorded.gateway, recorded.legacy]
+    .some(cell => cell?.present === true && equal(existing, cell.value));
+  if (existing !== undefined && (!object(existing) || !(typeof baseUrl === 'string' && url === baseUrl) && !owned)) {
     throw new Error('the setup-owned provider name is already used by another configuration');
   }
 }
-module.exports = { object, equal, parse, load, patch, save, command, checkOwnedProvider };
+module.exports = { object, equal, parse, load, patch, save, command, recordedProvider, checkOwnedProvider };
 AGENT_AUTH_5C44F65AEEC4D5B50F96
   "${cat_bin}" > "${scratch_dir}/native/omp.cjs" <<'AGENT_AUTH_BD4D881668518F214714'
 'use strict';
@@ -2407,15 +2423,21 @@ AGENT_AUTH_BD4D881668518F214714
   "${cat_bin}" > "${scratch_dir}/native/opencode.cjs" <<'AGENT_AUTH_2464A809E52279A1DF3E'
 'use strict';
 const fs = require('node:fs');
-const { load, patch, checkOwnedProvider } = require('./config-io.cjs');
+const { load, patch, recordedProvider, checkOwnedProvider } = require('./config-io.cjs');
 const { select } = require('./catalog.cjs');
 try {
-  const [source, destination, catalogFile, gateway, tokenFile, requested] = process.argv.slice(2);
+  const [source, destination, catalogFile, gateway, tokenFile, requested, configTarget] = process.argv.slice(2);
   if (/[{}]/.test(tokenFile)) throw new Error('OpenCode file-reference paths cannot contain braces');
   const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const current = load(source);
   const changes = [];
   const ids = Object.keys(catalog).map(provider => `agent-auth-${provider}`);
+  const retired = ['anthropic', 'openai-codex'].filter(provider => !Object.hasOwn(catalog, provider)).map(provider => `agent-auth-${provider}`);
+  for (const id of retired) {
+    checkOwnedProvider(current.provider?.[id], null, ['options', 'baseURL'],
+      recordedProvider(tokenFile, 'opencode', configTarget, ['provider', id]));
+    changes.push([['provider', id], undefined]);
+  }
   for (const [provider, cards] of Object.entries(catalog)) {
     const id = `agent-auth-${provider}`;
     const baseURL = provider === 'anthropic' ? `${gateway}/anthropic/v1` : `${gateway}/v1`;
@@ -2423,7 +2445,8 @@ try {
     if (existing !== undefined && existing.options === undefined) throw new Error('the setup-owned OpenCode provider name is already in use');
     // Adopt the prior same-gateway native route, then replace it with chat.
     const priorURL = `${gateway}/${provider}/v1`;
-    checkOwnedProvider(existing?.options, existing?.options?.baseURL === priorURL ? priorURL : baseURL, 'baseURL');
+    checkOwnedProvider(existing, existing?.options?.baseURL === priorURL ? priorURL : baseURL, ['options', 'baseURL'],
+      recordedProvider(tokenFile, 'opencode', configTarget, ['provider', id]));
     const headers = existing?.options?.headers;
     const ownHeader = provider === 'anthropic' && headers && Object.keys(headers).length === 1 &&
       headers.Authorization === `Bearer {file:${tokenFile}}`;
@@ -2455,14 +2478,15 @@ try {
     if (previous && selected !== previous && selected !== `agent-auth-${previous}`) console.error(`OpenCode: replacing unsupported ${key} ${previous} with ${selected}.`);
     changes.push([[key], selected]);
   }
-  if (Array.isArray(current.enabled_providers)) changes.push([['enabled_providers'], [...new Set([...current.enabled_providers, ...ids])]]);
+  if (Array.isArray(current.enabled_providers)) changes.push([['enabled_providers'],
+    [...new Set([...current.enabled_providers.filter(id => !retired.includes(id)), ...ids])]]);
   patch(source, destination, changes);
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 AGENT_AUTH_2464A809E52279A1DF3E
   "${cat_bin}" > "${scratch_dir}/native/pi.cjs" <<'AGENT_AUTH_78D04398CFC472391FF9'
 'use strict';
 const fs = require('node:fs');
-const { load, patch, command, checkOwnedProvider } = require('./config-io.cjs');
+const { load, patch, command, recordedProvider, checkOwnedProvider } = require('./config-io.cjs');
 const { select } = require('./catalog.cjs');
 
 // Stock Pi 0.85.1: custom generic Responses avoids its JWT-only Codex adapter.
@@ -2490,17 +2514,24 @@ function model(card, provider) {
   return value;
 }
 try {
-  const [kind, source, destination, catalogFile, gateway, cat, tokenFile, requested] = process.argv.slice(2);
+  const [kind, source, destination, catalogFile, gateway, cat, tokenFile, requested, configTarget] = process.argv.slice(2);
   const catalog = JSON.parse(fs.readFileSync(catalogFile, 'utf8'));
   const current = load(source, kind === 'settings');
   const selected = Object.keys(catalog)[0];
   if (kind === 'models') {
     const changes = [];
+    for (const provider of ['anthropic', 'openai-codex']) {
+      if (Object.hasOwn(catalog, provider)) continue;
+      const id = `agent-auth-${provider}`;
+      checkOwnedProvider(current.providers?.[id], null, ['baseUrl'],
+        recordedProvider(tokenFile, 'pi', configTarget, ['providers', id]));
+      changes.push([['providers', id], undefined]);
+    }
     for (const [provider, cards] of Object.entries(catalog)) {
       const id = `agent-auth-${provider}`;
       const baseUrl = `${gateway}/${provider}${provider === 'openai-codex' ? '/v1' : ''}`;
       const existing = current.providers?.[id];
-      checkOwnedProvider(existing, baseUrl, 'baseUrl');
+      checkOwnedProvider(existing, baseUrl, ['baseUrl'], recordedProvider(tokenFile, 'pi', configTarget, ['providers', id]));
       if (existing?.oauth || existing?.headers || existing?.modelOverrides) {
         throw new Error('existing Pi gateway provider has auth/header/model overrides; resolve these before setup');
       }
@@ -2840,17 +2871,21 @@ function main() {
         file.restoreSource ? readConfig(file.restoreSource, file.format, yq, strict(file)) : value;
       const paths = normalizedPaths([...ownedPaths(harness, file.role, value, gateway), ...(previous?.fields.map(field => field.path) ?? [])], baseline);
       const fields = [];
+      let recovering = false;
       for (const keys of paths) {
         let before = at(baseline, keys);
         const old = previous?.fields.find(field => equal(field.path, keys));
-        // Enabled edits belong to the gateway, never to normal login. Only an
-        // explicit reconfigure while disabled may update the saved normal value.
-        if (old && state.mode === 'enabled') before = old.before;
+        const now = at(value, keys);
+        const residue = old && !equal(now, old.before)
+          && (equal(now, old.gateway) || old.legacy !== undefined && equal(now, old.legacy));
+        recovering ||= residue;
+        // Only normal-mode edits change the saved baseline. A state-first
+        // interrupted disable may still have gateway values in the config.
+        if (old && (state.mode === 'enabled' || residue)) before = old.before;
         if (old?.members && Array.isArray(at(value, keys).value)) {
-          before = { present: true, value: at(value, keys).value.filter(id => state.mode !== 'enabled' || !old.members.includes(id)) };
+          before = { present: true, value: at(value, keys).value.filter(id => !old.members.includes(id)) };
         }
         const after = at(gateway, keys);
-        const now = at(value, keys);
         if (!equal(before, after) || !equal(now, before)) {
           const field = { path: keys, before, gateway: after };
           // What the file holds right now (a legacy route, or the previous gateway
@@ -2865,7 +2900,7 @@ function main() {
           fields.push(field);
         }
       }
-      const parents = previous && state.mode === 'enabled' ? previous.absentParents : absentParents(paths, baseline);
+      const parents = previous && (state.mode === 'enabled' || recovering) ? previous.absentParents : absentParents(paths, baseline);
       records.push({ path: file.path, kind: file.kind, format: file.format, role: file.role, fields, absentParents: parents });
       // A config that gains no gateway field is left alone (not created, not rewritten).
       if (action === 'configure') operations.set(file.index, !fields.length ? 'keep' : previousState || legacy ? 'managed' : 'write');
