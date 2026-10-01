@@ -2191,6 +2191,12 @@ try {
   const bundled = JSON.parse(fs.readFileSync(bundledFile, 'utf8'));
   if (!Array.isArray(bundled.models)) throw new Error('Codex did not return its native bundled model catalog');
   const baseUrl = `${gateway}/openai-codex/v1`;
+  const provider = {
+    name: 'Agent Auth', base_url: baseUrl, wire_api: 'responses',
+    requires_openai_auth: false, supports_websockets: false,
+    request_max_retries: 0, stream_max_retries: 0,
+    auth: { command: cat, args: [tokenFile], timeout_ms: 5000, refresh_interval_ms: 300000 },
+  };
   const previous = current.model_providers?.agent_auth;
   checkOwnedProvider(load(sourceFile, true).model_providers?.agent_auth, baseUrl, ['base_url'],
     recordedProvider(tokenFile, 'codex', configTarget, ['model_providers', 'agent_auth']));
@@ -2199,6 +2205,10 @@ try {
   }
   if (previous?.auth && Object.keys(previous.auth).some(key => !['command', 'args', 'timeout_ms', 'refresh_interval_ms'].includes(key))) {
     throw new Error('existing Codex auth helper has additional settings; resolve these before installing the file-backed helper');
+  }
+  // Profiles inherit provider fields from the base even after their own entry is replaced.
+  if (previous && Object.keys(previous).some(key => !Object.hasOwn(provider, key))) {
+    throw new Error('existing Codex gateway provider has additional settings; resolve these before setup');
   }
   // Keep the installed client's real instructions/tool defaults. The public
   // gateway card is not a Codex ModelInfo and contains no replacement prompt.
@@ -2266,12 +2276,7 @@ try {
   save(patchFile, {
     model: selected.slug, model_provider: 'agent_auth', model_catalog_json: finalModelsFile,
     features: { enable_request_compression: false },
-    model_providers: { agent_auth: {
-      name: 'Agent Auth', base_url: baseUrl, wire_api: 'responses',
-      requires_openai_auth: false, supports_websockets: false,
-      request_max_retries: 0, stream_max_retries: 0,
-      auth: { command: cat, args: [tokenFile], timeout_ms: 5000, refresh_interval_ms: 300000 },
-    } },
+    model_providers: { agent_auth: provider },
   });
 } catch (error) { console.error(`setup failed: ${error.message}`); process.exitCode = 1; }
 AGENT_AUTH_174B49BDE65749A4F18F
