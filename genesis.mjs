@@ -2018,6 +2018,16 @@ async function showCapacity(session) {
 async function showConnections(session) {
   out(renderConnections(await api(session, 'GET', '/admin/api/cli/connections')));
 }
+// The owner grants or removes Issuer on a key by name: an Issuer key
+// provisions organization keys through /v1/issuer/keys.
+const KEY_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
+async function setIssuer(session, action, name) {
+  const payload = await api(session, 'POST', '/admin/api/cli/issuer', { name, issuerAccess: action === 'grant' });
+  if (!record(payload) || payload.name !== name || typeof payload.issuerAccess !== 'boolean') {
+    throw new CliError('the gateway answered issuer with an unexpected shape');
+  }
+  done(payload.issuerAccess ? 'Granted' : 'Removed', `Issuer ${payload.issuerAccess ? 'on' : 'from'} ${name} ${glyph.dot} ${environmentLabel(session.environment)}`);
+}
 const SMOKE_PROMPT = 'Reply with exactly: pong';
 const SMOKE_ROUTES = { anthropic: '/anthropic/v1/messages', 'openai-codex': '/openai-codex/v1/responses' };
 const SMOKE_TERMINAL = { anthropic: 'message_stop', 'openai-codex': 'response.completed' };
@@ -3237,6 +3247,7 @@ const HELP = `Usage: genesis [command] [options]
   connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
   smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
   token rotate [--yes]                      owner
+  issuer grant | remove <key>               owner: whether the key may issue organization keys
   update | --update
   --version | --help
 
@@ -3326,6 +3337,11 @@ async function main(argv) {
     case 'token':
       if (rest.length !== 1 || rest[0] !== 'rotate') throw usage('token takes rotate; see genesis --help');
       await rotateToken(await requireSession(flags), flags);
+      return;
+    case 'issuer':
+      if (rest.length !== 2 || !['grant', 'remove'].includes(rest[0])) throw usage('issuer takes grant or remove and a key name; see genesis --help');
+      if (!KEY_NAME.test(rest[1])) throw usage('a key name is 1-32 of a-z, 0-9 and -, starting with a letter or digit');
+      await setIssuer(await requireSession(flags), rest[0], rest[1]);
       return;
     default: throw usage(`unknown command ${command}; see genesis --help`);
   }
