@@ -1952,6 +1952,10 @@ Account: ${session.name} · ${session.role} · ${session.identityClass ?? 'inter
 - Child key for product workers (Server access required):
     curl -sS -X POST ${endpoint}/v1/leases -H "Authorization: Bearer $GENESIS_KEY" -H "Content-Type: application/json" -d '{"ttlSeconds":3600}'
     → {"token":"…","leaseId":"…","expiresAt":"…"}   (ttlSeconds 1–43200; default 3600)
+  Optional spend cap on a child: add "cap":{"spendCapUsd":5,"maxOpenCalls":4,"spendScope":"run-123"}
+    (USD above 0; open calls 1–64; scope 1–160 of A-Z a-z 0-9 . _ : -). Children with the same scope share
+    the budget under your key; once spend reaches it, calls return 422 spend_cap_exhausted, and calls past
+    the open-call limit return 429 spend_concurrency_exhausted. The reply echoes the sealed cap.
   A child can read the catalog and call models, nothing else. Revoke one early:
     curl -sS -X POST ${endpoint}/v1/leases/revoke -H "Authorization: Bearer $GENESIS_KEY" -H "Content-Type: application/json" -d '{"leaseId":"…"}'
 
