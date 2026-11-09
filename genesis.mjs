@@ -35,14 +35,12 @@ const MODEL_ID = /^[\x21-\x7e]{1,256}$/;
 const PROVIDER_LABELS = { anthropic: 'Anthropic', 'openai-codex': 'OpenAI' };
 const WINDOWS = ['today', '7d', '30d', 'all'];
 
-// Two environments, each with its own gateway URL and personal key. `prod` is
-// the one every install creates; its URL defaults to the canonical Genesis
-// gateway but is whatever the person logs into. `staging` is a developer's
-// second gateway, gated on prod's identity.
+// Each environment owns its URL and personal key. Access is checked only by
+// the selected gateway; the other login stays untouched.
 const PROD_ENDPOINT = 'https://genesis.99point.co';
 const ENVIRONMENTS = Object.freeze({
   prod: { label: 'Prod', endpoint: PROD_ENDPOINT },
-  staging: { label: 'Staging' },
+  staging: { label: 'Staging', endpoint: 'https://genesis-staging.99point.co' },
 });
 function environmentId(value) {
   if (typeof value !== 'string' || !Object.hasOwn(ENVIRONMENTS, value)) throw usage('environment must be prod or staging');
@@ -277,10 +275,7 @@ function saveSession(session) {
 async function selectEnvironment(environment, view = null) {
   environmentId(environment);
   let session = loadSession(environment);
-  if (environment !== 'prod') {
-    if (session === null) session = await login({ environment }, view);
-    else await requireProdDev(view);
-  }
+  if (environment !== 'prod' && session === null) session = await login({ environment }, view);
   const store = loadStore();
   store.environment = environment;
   writeSessionText(JSON.stringify(store, null, 2) + '\n');
@@ -300,9 +295,6 @@ const notLoggedIn = environment => new CliError(`${environmentLabel(environment)
 async function requireSession(flags) {
   const store = loadStore();
   const environment = environmentId(flags.environment ?? store.environment);
-  if (environment !== 'prod') {
-    await runAction('Prod access', async view => { await requireProdDev(view); return false; }, true);
-  }
   const session = store.sessions[environment];
   if (session === undefined) throw notLoggedIn(environment);
   return { environment, ...session };
@@ -1327,10 +1319,6 @@ async function configure(session, client, flags, view = null) {
 async function switchScope(session, client, action, flags) {
   checkProfile(client, flags.profile);
   return runAction(`${action} ${client.label}`, async () => {
-    if (action === 'enable') {
-      const state = readState((await resolveScope(client, flags.profile)).stateFile, client.id);
-      if (state?.gateway && state.gateway !== (loadSession('prod')?.endpoint ?? PROD_ENDPOINT)) await requireProdDev();
-    }
     await runSetup(session, client, action, profileArgs(flags.profile), false);
     done({ enable: 'Enabled', disable: 'Disabled', unset: 'Unset' }[action], flags.profile ? `${client.label} (${flags.profile})` : client.label);
   });
@@ -1647,25 +1635,6 @@ function validateMe(value) {
   }
   return { name: value.name, role: value.role, email: value.email, identityClass: identityClassOf(value.identityClass) };
 }
-const isProdDev = identity => identity?.identityClass === 'internal' && ['owner', 'admin'].includes(identity.role);
-// A second gateway is a developer feature: the stored prod key must still be
-// accepted by prod's gateway and belong to an internal owner or admin.
-async function requireProdDev(view = null) {
-  const prod = loadSession('prod');
-  if (prod === null) throw new CliError('Prod login required for another gateway; run genesis login --environment prod first');
-  const check = async () => {
-    let identity;
-    try { identity = await request(prod.endpoint, prod.token, 'GET', '/admin/api/cli/me'); } catch (error) {
-      if (error instanceof HttpError && [401, 403].includes(error.status)) {
-        throw new CliError('Prod no longer accepts the stored key; run genesis login --environment prod again');
-      }
-      throw error;
-    }
-    validateMe(identity);
-    if (!isProdDev(identity)) throw new CliError('Another gateway requires an internal Prod owner or admin');
-  };
-  return view === null || screenOutput !== null ? check() : runProgress(view, 'Checking Prod access', check);
-}
 async function reachable(endpoint) {
   try {
     await request(endpoint, null, 'GET', '/healthz', undefined, 20_000);
@@ -1675,21 +1644,17 @@ async function reachable(endpoint) {
     return error.message;
   }
 }
-// Log into one environment: its gateway URL (a prompt offers the stored one,
-// or the canonical gateway for prod) and its own personal key. `--url` sets
-// the URL unattended; prod without a URL uses its default, staging refuses.
+// Log into one environment with its stored or canonical URL and its own key.
+// Saving the login changes neither the other login nor the selected environment.
 export async function login(flags, view = null) {
   const store = loadStore();
   const environment = environmentId(flags.environment ?? store.environment);
   const label = environmentLabel(environment);
   let endpoint = flags.url === undefined ? store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint : environmentEndpoint(flags.url);
-  if (environment !== 'prod') await requireProdDev(view);
   const validateUrl = value => { try { return { value: environmentEndpoint(value) }; } catch (error) { return { error: error.message }; } };
   if (flags.url === undefined && interactive()) {
     done('Environment', label);
     endpoint = await ask(`${label} gateway URL`, validateUrl, 'Gateway', endpoint ?? null);
-  } else if (endpoint === undefined) {
-    throw usage(`${label} is not configured; run genesis login --environment ${environment} --url URL with its own AGENT_AUTH_TOKEN`);
   }
   let token = process.env.AGENT_AUTH_TOKEN ?? '';
   if (token !== '' && interactive() && Object.entries(store.sessions).some(([other, session]) => other !== environment && session.token === token)) token = '';
@@ -1706,7 +1671,6 @@ export async function login(flags, view = null) {
     else {
       checkSessionIsolation(store, environment, endpoint, token);
       const check = async () => {
-        if (environment !== 'prod') await requireProdDev();
         const problem = await reachable(endpoint);
         if (problem !== null) throw new CliError(problem);
         done('Gateway', endpoint);
@@ -1790,14 +1754,13 @@ async function applyEnvironment(session, flags, view = null) {
 }
 
 // ── setup ───────────────────────────────────────────────────────────────────
-// The installer's walkthrough, prod only: log in (URL and key), select prod,
-// configure the installed clients for it, then open the dashboard. Rerun any
-// time; a stored login that the gateway still accepts is kept.
+// Log into the selected environment, configure its clients, then open its
+// dashboard. Keep a stored login that this gateway still accepts.
 async function setup(flags) {
-  if (flags.environment !== undefined && flags.environment !== 'prod') throw usage('setup creates prod; use genesis environment staging for a second gateway');
+  const environment = environmentId(flags.environment ?? loadStore().environment);
   if (!interactive()) throw usage('setup needs a terminal; run genesis login and genesis apply --overwrite instead');
-  out(paint('1', 'Set up Prod'));
-  let session = flags.url === undefined ? loadSession('prod') : null;
+  out(paint('1', `Set up ${environmentLabel(environment)}`));
+  let session = flags.url === undefined ? loadSession(environment) : null;
   if (session !== null) {
     try { validateMe(await request(session.endpoint, session.token, 'GET', '/admin/api/cli/me')); done('Logged in', sessionIdentity(session)); } catch (error) {
       if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
@@ -1805,14 +1768,14 @@ async function setup(flags) {
       session = null;
     }
   }
-  if (session === null) session = await login({ environment: 'prod', url: flags.url });
+  if (session === null) session = await login({ environment, url: flags.url });
   const store = loadStore();
-  if (store.environment !== 'prod') {
-    store.environment = 'prod';
+  if (store.environment !== environment) {
+    store.environment = environment;
     writeSessionText(JSON.stringify(store, null, 2) + '\n');
   }
   await applyEnvironment(session, flags);
-  return dashboard({ environment: 'prod' });
+  return dashboard({ environment });
 }
 async function status(session, flags) {
   header(session);
@@ -2848,10 +2811,8 @@ async function prepareAccount(session, view) {
 async function refreshIdentity(session, view) {
   try {
     const value = await runProgress(view, 'Checking saved login', () => api(session, 'GET', '/admin/api/cli/me'));
-    view.prodDev = session.environment === 'prod' && isProdDev(value);
     return currentSession(session, value);
   } catch (error) {
-    view.prodDev = false;
     if (error instanceof HttpError && error.status === 401) {
       return null;
     }
@@ -2867,7 +2828,6 @@ async function dashboard(flags, entry = null) {
   if (!interactive()) throw usage('no terminal; run a command instead (genesis --help)');
   let environment = environmentId(flags.environment ?? loadStore().environment);
   let session = loadSession(environment);
-  let prodDev = false;
   let failed = false;
   const stack = [{ route: 'dashboard', title: 'genesis', selected: 0, root: true, ready: false }];
   const pendingClosures = new Set();
@@ -2897,35 +2857,18 @@ async function dashboard(flags, entry = null) {
     const parent = stack.at(-1);
     if (parent !== undefined) parent.selectionOptions = null;
   };
-  // The main menu depends on who is logged in where: it is rebuilt whenever
-  // that changed underneath a prepared screen (a child's Main recheck can
-  // drop the session), not only after an acknowledged mutation.
-  const stateKey = () => `${environment}\u0000${session?.token ?? ''}\u0000${session?.role ?? ''}\u0000${prodDev}`;
+  // Refresh the menu when the selected login or its permissions change.
+  const stateKey = () => `${environment}\u0000${session?.token ?? ''}\u0000${session?.role ?? ''}\u0000${session?.identityClass ?? ''}`;
   const actions = [
     { value: 'configure', label: 'Configure' }, { value: 'model', label: 'Model' },
     { value: 'enable', label: 'Enable' }, { value: 'disable', label: 'Disable' }, { value: 'unset', label: 'Unset' },
   ];
-  const authorizeSecondary = async view => {
-    try { await requireProdDev(view); prodDev = true; } catch (error) {
-      prodDev = false;
-      if (environment !== 'prod') session = null;
-      throw error;
-    }
-  };
   if (ansi()) { terminal.alternateScreen = true; term('\x1b[?1049h'); }
   try {
-    if (environment !== 'prod') {
-      try { await authorizeSecondary(stack[0]); } catch (error) {
-        if (error instanceof Interrupt) throw error;
-        push('result', 'Prod access');
-        fail(stack.at(-1), `Failed ${glyph.dot} Prod access`, error.message);
-      }
-    }
     if (session !== null) {
       const initial = stack[0];
       const endpoint = session.endpoint;
       session = await refreshIdentity(session, initial);
-      if (environment === 'prod') prodDev = initial.prodDev;
       if (session === null) {
         push('result', 'Saved login', { endpoint });
         fail(stack.at(-1), `Failed ${glyph.dot} Check saved login`, `${hostOf(endpoint)} no longer accepts the stored key; log in again`);
@@ -2956,18 +2899,11 @@ async function dashboard(flags, entry = null) {
           renderScreen({ ...view, body: '', options: [] });
           session = await login({ environment }, view);
           view.mutating = true;
-          if (environment === 'prod') {
-            try { await requireProdDev(view); prodDev = true; } catch (error) {
-              if (error instanceof Interrupt) throw error;
-              prodDev = false;
-            }
-          }
           delete view.notice;
           showResult(view, `Complete ${glyph.dot} ${view.title.split(` ${glyph.step} `).at(-1)}`);
           continue;
         }
         if (view.route === 'add') {
-          if (environment !== 'prod') await authorizeSecondary(view);
           const { cleanup, connected } = await addConnection(session, {}, view);
           const parent = stack.at(-2);
           // A link that settled as connected changed the inventory the parent
@@ -2986,7 +2922,6 @@ async function dashboard(flags, entry = null) {
           continue;
         }
         if (view.route === 'console') {
-          if (environment !== 'prod') await authorizeSecondary(view);
           view.body = await runProgress(view, 'Console link', () => consoleLink(session));
           showResult(view, `Console ${glyph.dot} ${session.name}`);
           continue;
@@ -2997,7 +2932,6 @@ async function dashboard(flags, entry = null) {
           continue;
         }
         if (view.route === 'limitEdit') {
-          if (environment !== 'prod') await authorizeSecondary(view);
           const model = view.modelId;
           renderScreen({ ...view, prompt: true, body: '', options: [] });
           const label = model ? `${model} monthly USD` : 'Monthly USD';
@@ -3030,10 +2964,6 @@ async function dashboard(flags, entry = null) {
           continue;
         }
         if (view.route === 'smoke') {
-          // Staging is only reached with live Prod developer access: the
-          // recheck happens here, before any request, like every other
-          // secondary-gateway read.
-          if (environment !== 'prod') await authorizeSecondary(view);
           view.body = '';
           await smoke(session, {}, view);
           showResult(view, `Complete ${glyph.dot} Smoke`);
@@ -3042,22 +2972,19 @@ async function dashboard(flags, entry = null) {
         if (view.route === 'dashboard' && view.ready && view.stateKey !== stateKey()) view.ready = false;
         if (!view.ready) {
           const prepare = async () => {
-            if (environment !== 'prod' && ['model', 'usage', 'limitModels', 'capacity', 'connections'].includes(view.route)) await authorizeSecondary(view);
             if (view.route === 'dashboard') {
               // refreshIdentity() is the sole /me read for this dashboard.
-              // In particular, do not turn a prepared main menu into a
-              // second network request just to decide whether Environment fits.
               const rows = session === null ? null : await statusRows(session);
               view.statusRows = rows;
               view.body = rows === null ? '' : renderStatus(rows);
               view.options = session === null
                 ? [
-                  ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
-                  ...(environment !== 'prod' && !prodDev ? [{ value: 'prod', label: 'Prod' }] : [{ value: 'login', label: 'Log in' }]),
+                  { value: 'environment', label: 'Environment', hint: environmentLabel(environment) },
+                  { value: 'login', label: 'Log in' },
                   { value: 'clients', label: 'Clients' }, { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
                 ]
                 : [
-                  ...(prodDev ? [{ value: 'environment', label: 'Environment', hint: environmentLabel(environment) }] : []),
+                  { value: 'environment', label: 'Environment', hint: environmentLabel(environment) },
                   { value: 'apply', label: 'Apply', hint: `configure installed clients for ${environmentLabel(environment)}` },
                   { value: 'clients', label: 'Clients' },
                   { value: 'usage', label: 'Usage', hint: accountTabs(session).map(tab => tab.label.toLowerCase()).join(` ${glyph.dot} `) },
@@ -3070,7 +2997,6 @@ async function dashboard(flags, entry = null) {
                   { value: 'logout', label: 'Log out' }, { value: 'update', label: 'Update' }, { value: BACK, label: 'Quit' },
                 ];
             } else if (view.route === 'environment') {
-              await authorizeSecondary(view);
               view.options = [...Object.entries(ENVIRONMENTS).map(([value, entry]) => ({
                 value, label: entry.label, hint: value === environment ? 'current' : undefined,
               })), backOption];
@@ -3130,16 +3056,6 @@ async function dashboard(flags, entry = null) {
         if (choice === BACK) { pop(view.mutating === true); continue; }
         if (view.route === 'dashboard') {
           const label = view.options.find(option => option.value === choice).label;
-          if (choice === 'prod') {
-            session = await selectEnvironment('prod');
-            environment = 'prod';
-            view.ready = false;
-            if (session !== null) {
-              session = await refreshIdentity(session, view);
-              prodDev = view.prodDev;
-            }
-            continue;
-          }
           if (['apply', 'logout', 'update'].includes(choice)) push('confirm', label, { action: choice, actionLabel: label, mutating: true });
           else if (choice === 'key' || choice === 'smoke') push(choice, label);
           else if (choice === 'usage') push('usage', label, accountFields(session, { tab: 'usage', period: 'month' }));
@@ -3147,9 +3063,19 @@ async function dashboard(flags, entry = null) {
         } else if (view.route === 'environment') {
           const next = await selectEnvironment(choice, view);
           environment = choice;
-          session = next;
+          session = next === null ? null : await refreshIdentity(next, view);
           view.identity = session === null ? `${environmentLabel(environment)} ${glyph.dot} not logged in` : sessionIdentity(session);
           view.mutating = true;
+          if (next !== null && session === null) {
+            fail(view, `Failed ${glyph.dot} Check saved login`, `${hostOf(next.endpoint)} no longer accepts the stored key; log in again`);
+            continue;
+          }
+          if (view.notice) {
+            const notice = view.notice;
+            delete view.notice;
+            fail(view, `Failed ${glyph.dot} Check saved login`, notice);
+            continue;
+          }
           showResult(view, `Complete ${glyph.dot} Environment selected`,
             `${environmentLabel(environment)}\nGateway ${session?.endpoint ?? ENVIRONMENTS[environment].endpoint}\n${session === null ? 'Not logged in' : `Logged in as ${session.name}`}\nClient configurations unchanged`);
         } else if (view.route === 'key') {
@@ -3186,7 +3112,6 @@ async function dashboard(flags, entry = null) {
         } else if (view.route === 'confirm') {
           view.body = '';
           await runProgress(view, `${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}`, async () => {
-            if (environment !== 'prod' && !['update', 'disable', 'logout'].includes(view.action)) await authorizeSecondary();
             if (view.action === 'rotate') await Promise.all(pendingClosures);
             const flags = { profile: view.row?.profile || undefined, model: view.model, overwrite: true };
             if (view.action === 'configure') await configure(session, view.row.client, flags);
@@ -3194,7 +3119,7 @@ async function dashboard(flags, entry = null) {
             else if (['enable', 'unset'].includes(view.action)) await switchScope(session, view.row.client, view.action, flags);
             else if (view.action === 'rotate') await rotateToken(session, { yes: true }, next => { session = next; });
             else if (view.action === 'apply') await applyEnvironment(session, flags);
-            else if (view.action === 'logout') { logout({ environment }); session = null; if (environment === 'prod') prodDev = false; }
+            else if (view.action === 'logout') { logout({ environment }); session = null; }
             else if (view.action === 'update') await update();
           });
           showResult(view, `Complete ${glyph.dot} ${view.actionLabel}${view.row ? ` ${view.row.label}` : ''}`);
@@ -3230,7 +3155,7 @@ async function dashboard(flags, entry = null) {
 const HELP = `Usage: genesis [command] [options]
 
   genesis                                   dashboard
-  setup [--url URL]                         log into prod (URL and key), then configure installed clients
+  setup [--url URL]                         log into the selected environment, then configure installed clients
   environment [prod | staging]
   login [--url URL]                         sign in (AGENT_AUTH_TOKEN or a hidden prompt)
   logout
@@ -3304,7 +3229,6 @@ async function main(argv) {
         }
         const store = loadStore();
         const environment = flags.environment ?? store.environment;
-        if (rest.length === 0 && environment !== 'prod') await requireProdDev(view);
         out(`${environmentLabel(environment)} ${glyph.dot} ${store.sessions[environment]?.endpoint ?? ENVIRONMENTS[environment].endpoint ?? 'not configured'}`);
       };
       if (rest.length === 0) await apply(null);
