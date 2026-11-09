@@ -3035,7 +3035,8 @@ async function dashboard(flags, entry = null) {
               view.options = [backOption];
             } else if (view.route === 'connections') {
               view.body = renderConnections(await api(session, 'GET', '/admin/api/cli/connections'));
-              view.options = [...(session.role === 'owner' ? [{ value: 'add', label: 'Add connection' }] : []), backOption];
+              view.options = [...(session.role === 'owner' || session.role === 'admin' && session.identityClass === 'internal'
+                ? [{ value: 'add', label: 'Add connection' }] : []), backOption];
             } else if (view.route === 'smoke') {
               view.options = [];
             } else if (view.route === 'confirm') {
@@ -3173,7 +3174,7 @@ const HELP = `Usage: genesis [command] [options]
   console                                   one-time browser login link
   connect [--copy]                          API integration guide for this gateway (endpoints, keys, SDK setup); --copy puts it on the clipboard
   capacity                                  owner/admin
-  connections [list | add]                  owner/admin; add: owner, serves a local page [--provider P] [--worker ID] [--port N]
+  connections [list | add]                  owner/admin; add serves a local page [--provider P] [--worker ID] [--port N]
   smoke [--json] [--environment E]          gateway health, login, models and one real call per provider
   token rotate [--yes]                      owner
   issuer grant | remove <key>               owner: whether the key may issue organization keys
